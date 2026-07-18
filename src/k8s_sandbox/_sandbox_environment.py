@@ -40,6 +40,7 @@ from k8s_sandbox._logger import (
     log_trace,
     log_warn,
 )
+from k8s_sandbox._network_access import NetworkAccessValuesSource
 from k8s_sandbox._manager import (
     HelmReleaseManager,
     uninstall_all_unmanaged_releases,
@@ -567,6 +568,11 @@ def _create_values_source(config: _ResolvedConfig) -> ValuesSource:
                 "supported when using the built-in Helm chart."
             )
         return ComposeValuesSource(config.values)
+    # Built-in chart + a plain Helm values file: normalize the egress keys through
+    # NetworkAccess so the values= path enforces the same policy vocabulary as compose.
+    # Custom charts (config.chart set) are opaque and pass through untouched.
+    if config.values is not None and config.chart is None:
+        return NetworkAccessValuesSource(config.values)
     return StaticValuesSource(config.values)
 
 
