@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Poll sandbox-service requests every 10s instead of every 2s, removing a fixed per-sandbox exec cost that limited how many samples could run concurrently. Set `INSPECT_SANDBOX_POLLING_INTERVAL` (seconds) to tune; lowering it costs concurrency, raising it adds up to one interval of latency to bridged RPCs (e.g. agent MCP calls).
 - Stop formatting log arguments for every pod operation when the destination log level is disabled. Sandbox operations no longer spend ~16us each building trace messages that are then discarded, which on a busy eval-set runner was consuming a full CPU core of Python execution and could leave the run unable to answer `inspect ctl`.
 - Fix intermittent `exec()` failures with `'NoneType' object has no attribute 'decode'` under high concurrency.
 - Fix the built-in chart's `-sandbox-default-deny-ingress` policy, which allowed all ingress instead of denying it. Ingress to sandbox pods not allowed by another policy is now denied.
