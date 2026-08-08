@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import sys
@@ -100,6 +101,22 @@ def _retry() -> AsyncRetrying:
     )
 
 
+INSPECT_SANDBOX_POLLING_INTERVAL = "INSPECT_SANDBOX_POLLING_INTERVAL"
+# Seconds between sandbox-service request polls. See
+# K8sSandboxEnvironment.default_polling_interval for why the base class's 2s is
+# too aggressive on Kubernetes.
+DEFAULT_POLLING_INTERVAL = 10.0
+
+
+def _get_environ_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except KeyError:
+        return default
+    except ValueError as e:
+        raise ValueError(f"{name} must be a float: '{os.environ[name]}'.") from e
+
+
 @sandboxenv(name="k8s")
 class K8sSandboxEnvironment(SandboxEnvironment):
     """An Inspect sandbox environment for a Kubernetes (k8s) cluster."""
@@ -142,6 +159,30 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
             # even if the adjustment failed, there's no point trying again
             K8sSandboxEnvironment._rlimit_adjusted = True
+
+    def default_polling_interval(self) -> float:
+        """Seconds between sandbox-service request polls.
+
+        Inspect's `sandbox_service` polls for pending RPC requests by exec'ing
+        `find` into the sandbox, once per interval, for the sandbox's whole
+        lifetime and whether or not any request is pending. On Kubernetes an
+        exec is a WebSocket session against the API server that occupies a
+        pod-operation worker thread, so the base class's 2s makes every live
+        sandbox cost 0.5 execs/second before it does any work. That fixed tax
+        scales with sample concurrency and is what caps it: an eval set with
+        1900 concurrent sandboxes spends 950 execs/second polling empty queues.
+
+        `sandbox_service` treats this value as a floor (it takes the max of its
+        own argument and this), so raising it here cannot be undercut by a
+        caller. The cost is added latency on a bridged RPC -- bounded by one
+        interval -- which the callers' own timeouts (e.g. inspect_swe's 120s
+        MCP readiness budget) absorb comfortably.
+
+        Override with `INSPECT_SANDBOX_POLLING_INTERVAL` (seconds).
+        """
+        return _get_environ_float(
+            INSPECT_SANDBOX_POLLING_INTERVAL, DEFAULT_POLLING_INTERVAL
+        )
 
     @classmethod
     def config_files(cls) -> list[str]:

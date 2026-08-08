@@ -4,6 +4,7 @@ import os
 from contextlib import contextmanager
 from typing import Any, Generator
 
+from inspect_ai._util.logger import TRACE  # TODO: Using private package.
 from inspect_ai.util import trace_action, trace_message
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,22 @@ TRUNCATED_SUFFIX = "...<truncated-for-logging>"
 # The threshold at which to truncate individual arguments in logging messages.
 # Some ExecResults can contain very large outputs.
 DEFAULT_ARG_TRUNCATION_THRESHOLD = 1000
+
+# Formatting is skipped entirely when the destination level is disabled. It is not a
+# micro-optimisation: every sandbox operation formats its kwargs, and on a busy eval-set
+# runner that dominates the process. A py-spy sampling profile of a production runner
+# that had stopped answering its Inspect control channel put ~26% of all samples in
+# _format_kwargs_as_json, with the abc/inspect machinery it drives accounting for
+# most of the rest -- against ~18% for the actual TLS and WebSocket work. It burned
+# ~1 core of GIL with 31 cores idle and 325 of 326 threads asleep, so the asyncio event
+# loop could not get enough GIL time to service its own socket.
+#
+# All of that work was discarded: the runner logs at WARNING (effective level 30, no
+# root handlers), so TRACE and DEBUG were both disabled and every formatted string went
+# straight to a no-op logger call. Measured at 11.8us per call on a live runner.
+#
+# These checks are per-call, so raising the log level at runtime still produces full
+# detail. log_error/log_warn are deliberately not gated: they always emit.
 
 
 def log_trace(message: str, **kwargs: Any) -> None:
@@ -23,6 +40,8 @@ def log_trace(message: str, **kwargs: Any) -> None:
           they exceed DEFAULT_ARG_TRUNCATION_THRESHOLD (which can be overridden with env
           var INSPECT_K8S_LOG_TRUNCATION_THRESHOLD).
     """
+    if not logger.isEnabledFor(TRACE):
+        return
     formatted = format_log_message(message, **kwargs)
     trace_message(logger, category="K8s", message=formatted)
 
@@ -36,6 +55,8 @@ def log_debug(message: str, **kwargs: Any) -> None:
           they exceed DEFAULT_ARG_TRUNCATION_THRESHOLD (which can be overridden with env
           var INSPECT_K8S_LOG_TRUNCATION_THRESHOLD).
     """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     formatted = format_log_message(message, **kwargs)
     logger.debug(f"K8s: {formatted}")
 
@@ -93,6 +114,20 @@ def inspect_trace_action(action: str, **kwargs: Any) -> Generator[None, None, No
           Values are truncated if they exceed DEFAULT_ARG_TRUNCATION_THRESHOLD (which
           can be overridden with env var INSPECT_K8S_LOG_TRUNCATION_THRESHOLD).
     """
+    # This is the hot path: it wraps EVERY pod operation via _log_op.
+    #
+    # trace_action is purely observational -- every branch does nothing but
+    # logger.log(TRACE, ...) and it ends in a bare `raise`, so control flow is
+    # identical either way. With TRACE off it therefore produces no output at all,
+    # and the whole thing can be skipped: the kwargs formatting, the uuid, the
+    # monotonic timers, and traceback.format_exc() on the error path.
+    #
+    # Gating only the formatting removes 48% of the per-op cost; skipping the
+    # context manager as well removes 95% (16.0us -> 0.7us, measured).
+    if not logger.isEnabledFor(TRACE):
+        yield
+        return
+
     json_kwargs = _format_kwargs_as_json(**kwargs)
     with trace_action(logger, action, json_kwargs):
         yield
