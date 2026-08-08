@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a per-service `affinity` Helm value and a matching `x-inspect_k8s_sandbox.affinity` compose extension (alias `x-k8s`), for pod/node affinity rules that Compose cannot express. Use it to control how sandboxes are placed across nodes — for example a `podAffinity` on `kubernetes.io/hostname` to pack sandboxes onto fewer nodes. Unlike `nodeSelector`, affinity is not merged by a RuntimeClass, so it still works on clusters whose RuntimeClass pins a node selector.
 - `inspect sandbox cleanup k8s` (with no release name) now **exits non-zero** if any release fails to uninstall, rather than reporting `Complete.` and exiting 0. Releases which fail to uninstall are named, at end-of-task cleanup too, along with their namespace and the `inspect sandbox cleanup k8s <release>` command to retry them.
 - **BREAKING CHANGE**: Sandbox pods created by the built-in Helm chart no longer mount
   Kubernetes service-account API tokens by default. Set

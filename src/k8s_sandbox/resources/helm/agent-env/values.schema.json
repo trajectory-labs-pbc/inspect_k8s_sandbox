@@ -159,6 +159,9 @@
             "nodeSelector": {
               "type": "object"
             },
+            "affinity": {
+              "type": "object"
+            },
             "networkIsolated": {
               "type": "boolean"
             },
@@ -167,16 +170,41 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "name": {"type": "string"},
-                  "image": {"type": "string"},
-                  "command": { "type": "array", "items": { "type": "string" } },
-                  "args": { "type": "array", "items": { "type": "string" } },
-                  "imagePullPolicy": {"type": "string"},
-                  "workingDir": {"type": "string"},
-                  "resources": {"type": "object"},
-                  "securityContext": {"type": "object"}
+                  "name": {
+                    "type": "string"
+                  },
+                  "image": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "imagePullPolicy": {
+                    "type": "string"
+                  },
+                  "workingDir": {
+                    "type": "string"
+                  },
+                  "resources": {
+                    "type": "object"
+                  },
+                  "securityContext": {
+                    "type": "object"
+                  }
                 },
-                "required": ["name", "image"]
+                "required": [
+                  "name",
+                  "image"
+                ]
               }
             }
           },
@@ -231,7 +259,10 @@
       "type": "boolean"
     },
     "serviceAccountName": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
