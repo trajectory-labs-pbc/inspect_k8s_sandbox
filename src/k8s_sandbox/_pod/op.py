@@ -91,19 +91,15 @@ class PodOperation(ABC):
             _request_timeout=API_TIMEOUT,
             **kwargs,
         )
-        stop_keepalive = threading.Event()
-        keepalive = threading.Thread(
-            target=_send_keepalive,
-            args=(ws_client, stop_keepalive),
-            daemon=True,
-            name="ws-keepalive",
-        )
+        keepalive = _KEEPALIVE.register(ws_client)
         try:
             self._discard_duplicate_channel(ws_client)
-            keepalive.start()
             yield ws_client
         finally:
-            stop_keepalive.set()
+            # Unregister BEFORE close: it waits out any in-flight keepalive
+            # frame, so the shared thread is never writing to a socket the
+            # caller is closing (WSClient is not thread-safe).
+            keepalive.unregister()
             ws_client.close()
 
     def _discard_duplicate_channel(self, ws_client: WSClient) -> None:
@@ -181,40 +177,120 @@ def check_for_pod_restart(pod: PodInfo) -> None:
         )
 
 
-def _send_keepalive(ws_client: WSClient, stop: threading.Event) -> None:
-    """Send periodic resize-channel frames to prevent idle timeout.
+_KEEPALIVE_PAYLOAD = json.dumps({"Width": 80, "Height": 24}).encode()  # size arbitrary
 
-    Containerd's CRI streaming server closes WebSocket connections that receive no
-    data frames within stream_idle_timeout (default 4h). Standard WebSocket pings do
-    NOT reset this timer because the Python kubernetes client negotiates the
-    v4.channel.k8s.io subprotocol [1], whose server-side handler uses
-    golang.org/x/net/websocket. That library's Receive() silently consumes ping/pong
-    control frames in an internal loop [2][3] without returning to the caller, so the
-    resetTimeout() call in wsstream/conn.go (which sits *before* Receive()) is never
-    re-executed.
 
-    Writing to the resize channel (channel 4) sends a real data frame that causes
-    Receive() to return, triggering resetTimeout() [4]. The resize handler silently
-    ignores the payload since no TTY is allocated for non-interactive exec sessions.
+class _KeepaliveRegistration:
+    """Handle for one registered websocket.
 
-    [1] https://github.com/kubernetes-client/python/blob/6fb1fd723eeb8880626118aeb95ebb1a7c73d5ad/kubernetes/base/stream/ws_client.py#L468-L472
-    [2] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/websocket.go#L339-L349
-    [3] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/hybi.go#L290-L302
-    [4] https://github.com/kubernetes/kubernetes/blob/77b02b7ad40d36cd803856de5ba5922c947cb0aa/staging/src/k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go#L348-L356
+    ``unregister`` removes the socket and then waits until the shared thread
+    is not mid-send, so the caller can close the socket safely.
     """
-    payload = json.dumps({"Width": 80, "Height": 24}).encode()  # Size is arbitrary
-    while not stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
-        try:
-            if ws_client.is_open():
-                ws_client.write_channel(RESIZE_CHANNEL, payload)
-            else:
-                break
-        except Exception:
-            logger.debug(
-                "Failed to send k8s websocket keepalive frame, bailing out",
-                exc_info=True,
-            )
-            break
+
+    def __init__(self, keepalive: "_SharedKeepalive", ws_client: WSClient) -> None:
+        self._keepalive = keepalive
+        self._ws_client = ws_client
+
+    def unregister(self) -> None:
+        self._keepalive.unregister(self._ws_client)
+
+
+class _SharedKeepalive:
+    """One thread that pings every live exec websocket.
+
+    A thread per websocket does not scale: an eval with hundreds of concurrent
+    sandboxes ran ~100 "ws-keepalive" threads whose only job was to sleep 30s
+    at a time, and thread count growing with sandbox count starves the single
+    GIL that the caller's event loop also needs (measured: 455-498 threads,
+    1-2 runnable, multi-second event-loop stalls). One thread walking a
+    registry sends exactly the same frames.
+
+    ``WSClient`` is not thread-safe, so this class guarantees the invariant the
+    per-socket design left implicit: a socket removed from the registry is not
+    being written to once ``unregister`` returns. ``_send_lock`` is held across
+    each send and by ``unregister``; the registry mutex is never held during a
+    send, so registering never waits on network I/O.
+    """
+
+    def __init__(self) -> None:
+        self._registry_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._clients: list[WSClient] = []
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def register(self, ws_client: WSClient) -> _KeepaliveRegistration:
+        with self._registry_lock:
+            self._clients.append(ws_client)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name="ws-keepalive",
+                )
+                self._thread.start()
+        return _KeepaliveRegistration(self, ws_client)
+
+    def unregister(self, ws_client: WSClient) -> None:
+        with self._registry_lock:
+            try:
+                self._clients.remove(ws_client)
+            except ValueError:
+                pass
+        # Serialize with any in-flight send so the caller can close the socket.
+        with self._send_lock:
+            pass
+
+    def _snapshot(self) -> list[WSClient]:
+        with self._registry_lock:
+            return list(self._clients)
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait(_KEEPALIVE_INTERVAL_SECONDS)
+            self._wake.clear()
+            clients = self._snapshot()
+            if not clients:
+                # Exit while holding the registry lock so a concurrent
+                # register() either sees a live thread or starts a new one --
+                # it can never hand a socket to a thread that is exiting.
+                with self._registry_lock:
+                    if not self._clients:
+                        self._thread = None
+                        return
+                continue
+            for ws_client in clients:
+                self._send_one(ws_client)
+
+    def _send_one(self, ws_client: WSClient) -> None:
+        """Send one keepalive frame; drop the socket if it is unusable.
+
+        See the module comment on ``_KEEPALIVE_INTERVAL_SECONDS`` for why a
+        resize-channel data frame (not a ping) is what resets the server's
+        idle timer.
+        """
+        with self._send_lock:
+            with self._registry_lock:
+                if ws_client not in self._clients:
+                    return  # unregistered while we waited for the send lock
+            try:
+                if not ws_client.is_open():
+                    raise ConnectionError("websocket closed")
+                ws_client.write_channel(RESIZE_CHANNEL, _KEEPALIVE_PAYLOAD)
+                return
+            except Exception:
+                logger.debug(
+                    "Failed to send k8s websocket keepalive frame, dropping socket",
+                    exc_info=True,
+                )
+        with self._registry_lock:
+            try:
+                self._clients.remove(ws_client)
+            except ValueError:
+                pass
+
+
+_KEEPALIVE = _SharedKeepalive()
 
 
 def raise_for_known_read_write_errors(stderr: str) -> None:
