@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from abc import ABC
 from dataclasses import dataclass
 from typing import Generator, Literal
@@ -11,6 +12,7 @@ from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
 from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
 from k8s_sandbox._pod.snapshot import read_pod
+from k8s_sandbox._pod.timing import POD_OPERATION_TIMING, PodOperationTiming
 
 # The duration to wait for an initial response from the k8s API server.
 # The initial response is received before the command is necessarily complete, so
@@ -81,6 +83,7 @@ class PodOperation(ABC):
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
         # Note: ApiException is intentionally not caught; it should fail the eval.
+        stream_started_at = time.monotonic()
         ws_client: WSClient = stream(
             client.connect_get_namespaced_pod_exec,
             name=self._pod.name,
@@ -91,16 +94,25 @@ class PodOperation(ABC):
             _request_timeout=API_TIMEOUT,
             **kwargs,
         )
-        keepalive = _KEEPALIVE.register(ws_client)
+        stream_connected_at = time.monotonic()
         try:
-            self._discard_duplicate_channel(ws_client)
-            yield ws_client
+            keepalive = _KEEPALIVE.register(ws_client)
+            try:
+                self._discard_duplicate_channel(ws_client)
+                yield ws_client
+            finally:
+                # Unregister BEFORE close: it waits out any in-flight keepalive
+                # frame, so the shared thread is never writing to a socket the
+                # caller is closing (WSClient is not thread-safe).
+                keepalive.unregister()
+                ws_client.close()
         finally:
-            # Unregister BEFORE close: it waits out any in-flight keepalive
-            # frame, so the shared thread is never writing to a socket the
-            # caller is closing (WSClient is not thread-safe).
-            keepalive.unregister()
-            ws_client.close()
+            _ = POD_OPERATION_TIMING.set(
+                PodOperationTiming(
+                    connect_s=stream_connected_at - stream_started_at,
+                    command_s=time.monotonic() - stream_connected_at,
+                )
+            )
 
     def _discard_duplicate_channel(self, ws_client: WSClient) -> None:
         # Avoid issuing a warning multiple times.
