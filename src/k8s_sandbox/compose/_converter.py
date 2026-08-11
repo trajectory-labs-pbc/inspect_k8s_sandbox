@@ -559,10 +559,10 @@ class _ServiceConverter:
     ) -> None:
         """Apply the per-service 'x-inspect_k8s_sandbox' extension.
 
-        This is an escape hatch for expressing Kubernetes resources that the Docker
-        Compose shortcuts (mem_limit/cpus/deploy.resources) cannot, most notably
-        request-only resources such as 'ephemeral-storage'. Currently only a
-        'resources' block is supported.
+        This is an escape hatch for Kubernetes settings the Docker Compose shortcuts
+        cannot express: 'resources' for request-only resources such as
+        'ephemeral-storage' (which mem_limit/cpus/deploy.resources cannot state), and
+        'affinity' for scheduling rules that have no Compose equivalent at all.
         """
         if not isinstance(extensions, dict):
             raise ComposeConverterError(
@@ -571,10 +571,22 @@ class _ServiceConverter:
             )
         if (resources := extensions.pop("resources", None)) is not None:
             self._merge_extension_resources(resources, result)
+        if (affinity := extensions.pop("affinity", None)) is not None:
+            if not isinstance(affinity, dict):
+                raise ComposeConverterError(
+                    f"Invalid 'x-inspect_k8s_sandbox.affinity' type: {type(affinity)}. "
+                    f"Expected dict. {self.context}"
+                )
+            # Passed through verbatim: the chart hands it to the Pod's `affinity`, so
+            # the Kubernetes schema is the contract and validating a subset here would
+            # only date. Unlike nodeSelector, affinity is NOT merged by a RuntimeClass,
+            # so it stays available on clusters whose RuntimeClass pins a node selector.
+            result["affinity"] = affinity
         if extensions:
             raise ComposeConverterError(
                 f"Unsupported key(s) in service 'x-inspect_k8s_sandbox': "
-                f"{set(extensions)}. Only 'resources' is supported. {self.context}"
+                f"{set(extensions)}. Only 'resources' and 'affinity' are supported. "
+                f"{self.context}"
             )
 
     def _merge_extension_resources(self, src: Any, result: dict[str, Any]) -> None:

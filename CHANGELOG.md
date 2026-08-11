@@ -2,7 +2,10 @@
 
 ## Unreleased
 
+- Add a per-service `affinity` Helm value and a matching `x-inspect_k8s_sandbox.affinity` compose extension (alias `x-k8s`), for pod/node affinity rules that Compose cannot express. Use it to control how sandboxes are placed across nodes — for example a `podAffinity` on `kubernetes.io/hostname` to pack sandboxes onto fewer nodes. Unlike `nodeSelector`, affinity is not merged by a RuntimeClass, so it still works on clusters whose RuntimeClass pins a node selector.
+- Poll sandbox-service requests every 10s instead of every 2s, removing a fixed per-sandbox exec cost that limited how many samples could run concurrently. Set `INSPECT_SANDBOX_POLLING_INTERVAL` (seconds) to tune; lowering it costs concurrency, raising it adds up to one interval of latency to bridged RPCs (e.g. agent MCP calls).
 - Stop formatting log arguments for every pod operation when the destination log level is disabled. Sandbox operations no longer spend ~16us each building trace messages that are then discarded, which on a busy eval-set runner was consuming a full CPU core of Python execution and could leave the run unable to answer `inspect ctl`.
+- Keep WebSocket keepalives on one shared thread instead of one per open exec connection. A runner with hundreds of concurrent sandboxes no longer carries hundreds of mostly-idle keepalive threads, whose thread count alone slowed the eval's event loop.
 - Fix intermittent `exec()` failures with `'NoneType' object has no attribute 'decode'` under high concurrency.
 - Fix the built-in chart's `-sandbox-default-deny-ingress` policy, which allowed all ingress instead of denying it. Ingress to sandbox pods not allowed by another policy is now denied.
 - Raise an error when a conflicting `max_pod_ops` setting would otherwise be ignored.

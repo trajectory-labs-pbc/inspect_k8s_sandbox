@@ -10,6 +10,7 @@ from typing import Callable, TypeVar
 from inspect_ai.util import concurrency
 
 from k8s_sandbox._logger import log_debug, log_warn
+from k8s_sandbox._pod.timing import POD_OPERATION_TIMING, PodOperationTiming
 
 T = TypeVar("T")
 
@@ -123,6 +124,7 @@ class PodOpExecutor:
                 def run_op() -> T:
                     nonlocal started_at
                     started_at = time.monotonic()
+                    _ = context.run(POD_OPERATION_TIMING.set, None)
                     return context.run(callable)
 
                 try:
@@ -133,6 +135,7 @@ class PodOpExecutor:
                     finished_at = time.monotonic()
                     running = self._running
                     self._running -= 1
+                    pod_operation_timing = context.get(POD_OPERATION_TIMING)
                     self._log_op_timing(
                         submitted_at=submitted_at,
                         acquired_at=acquired_at,
@@ -140,6 +143,7 @@ class PodOpExecutor:
                         finished_at=finished_at,
                         queued=queued,
                         running=running,
+                        pod_operation_timing=pod_operation_timing,
                     )
         finally:
             if not acquired:
@@ -154,6 +158,7 @@ class PodOpExecutor:
         finished_at: float,
         queued: int,
         running: int,
+        pod_operation_timing: PodOperationTiming | None,
     ) -> None:
         total = finished_at - submitted_at
         fields: dict[str, object] = {
@@ -169,6 +174,16 @@ class PodOpExecutor:
             # Time in the synchronous Kubernetes call itself.
             "call_s": (
                 round(finished_at - started_at, 3) if started_at is not None else None
+            ),
+            "connect_s": (
+                round(pod_operation_timing.connect_s, 3)
+                if pod_operation_timing is not None
+                else None
+            ),
+            "command_s": (
+                round(pod_operation_timing.command_s, 3)
+                if pod_operation_timing is not None
+                else None
             ),
             "queued": queued,
             "running": running,

@@ -105,6 +105,8 @@ services:
     tolerations: []
     # -- Node selector settings for the Pod.
     nodeSelector: {}
+    # -- Affinity settings for the Pod (node, pod, and anti-affinity rules).
+    affinity: {}
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"
