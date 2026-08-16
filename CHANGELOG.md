@@ -5,6 +5,21 @@
 - Add per-service `x-inspect_k8s_sandbox.volumes` and `volumeMounts` compose
   extensions for Kubernetes volume types, including OCI image volumes, that Compose
   shorthand cannot express.
+- An `exec` whose pod stops answering now fails with `TimeoutError` once its
+  `timeout` plus a 30s grace has passed, a `read_file` that receives no data
+  for 60s fails with `PodError`, and a `write_file` that has not finished 60s
+  after sending the last of the file fails with `PodError`, instead of waiting
+  forever. An `exec` or `write_file` whose pod stops accepting its input also
+  fails with `PodError`. Previously a pod that died mid-command left the
+  operation, and any eval waiting on it, hung until the process was killed.
+- Cancelling a sandbox operation (e.g. an eval timing out or being interrupted) can
+  now take up to 30s longer to unwind. Previously a cancelled operation could stop
+  later sandbox operations from starting, keep the process from exiting, and raise
+  `ValueError: write to closed file` after a cancelled `read_file`.
+- `exec()`, `read_file()` and `write_file()` calls that take 5s or longer, including
+  the command's own run time, log a `Slow pod operation.` WARNING that splits the time
+  between waiting for a pod-operation slot (`INSPECT_MAX_POD_OPS`), connecting to the
+  pod and running the command.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
