@@ -1,14 +1,18 @@
+import shlex
+import threading
+import time
 from contextlib import contextmanager
-from typing import Generator
+from typing import Callable, Generator
 from unittest.mock import MagicMock, patch
 
 import pytest
 from inspect_ai.util import ExecResult
 from kubernetes.stream.ws_client import WSClient  # type: ignore
 
+import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import PodError
-from k8s_sandbox._pod.execute import ExecuteOperation
+from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
 
 
 def _make_ws_client(
@@ -298,3 +302,184 @@ class TestExecChunksStdin:
         assert ws.write_stdin.call_count > 1
         assert all(len(c.args[0]) <= 16 for c in ws.write_stdin.call_args_list)
         assert result is sentinel
+
+
+class TestShellCommand:
+    """`runuser` is only reached for when the container is not already that user."""
+
+    def test_no_user_opens_a_plain_shell(self) -> None:
+        assert _shell_command(None) == ["/bin/sh"]
+
+    def test_user_falls_back_to_runuser(self) -> None:
+        command = _shell_command("agent")
+
+        assert command[:2] == ["/bin/sh", "-c"]
+        assert "exec runuser -u agent -- /bin/sh" in command[2]
+
+    def test_user_skips_runuser_when_already_that_user(self) -> None:
+        """A no-op switch still needs CAP_SETGID, so avoid runuser when we can."""
+        script = _shell_command("agent")[2]
+
+        assert '[ "$(id -un 2>/dev/null)" = agent ]' in script
+        assert "then exec /bin/sh; fi" in script
+
+    def test_a_name_is_compared_against_the_name_and_a_uid_against_the_uid(
+        self,
+    ) -> None:
+        """Cross-comparing would match an account *named* "0" against uid 0."""
+        by_name = _shell_command("agent")[2]
+        by_uid = _shell_command("1000")[2]
+
+        assert "id -un" in by_name and "id -u " not in by_name
+        assert '[ "$(id -u 2>/dev/null)" = 1000 ]' in by_uid
+        assert "id -un" not in by_uid
+
+    def test_an_empty_user_is_left_to_runuser(self) -> None:
+        """It matches nothing, and an empty `id` output must not look equal."""
+        assert _shell_command("") == ["runuser", "-u", "", "--", "/bin/sh"]
+
+    @pytest.mark.parametrize("user", ["a b", "a;rm -rf /", "$(whoami)", "'"])
+    def test_user_is_quoted(self, user: str) -> None:
+        """The user reaches two more shell words than it used to; quote all three."""
+        script = _shell_command(user)[2]
+
+        assert script.count(shlex.quote(user)) == 2
+        assert user not in script.replace(shlex.quote(user), "")
+
+
+class TestRunuserErrorMessages:
+    @pytest.mark.parametrize(
+        ("stderr", "expected"),
+        [
+            ("runuser: user agent does not exist", "does not appear to exist"),
+        ],
+    )
+    def test_an_unknown_user_still_raises(self, stderr: str, expected: str) -> None:
+        """The one case no fallback can rescue: the name simply isn't there."""
+        executor = ExecuteOperation(MagicMock())
+
+        with pytest.raises(RuntimeError, match=expected):
+            executor._check_for_runuser_error(stderr, "agent")
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "runuser: may not be used by non-root users",
+            "runuser: cannot set groups: Operation not permitted",
+            "/bin/sh: 1: exec: runuser: not found",
+        ],
+    )
+    def test_environment_failures_warn_rather_than_raise(self, stderr: str) -> None:
+        """inspect-ai probes with user="root" and falls back when it fails.
+
+        All three describe an environment that cannot switch users, rather than a
+        caller naming something that does not exist. Raising made the fallback
+        unreachable, so a sandbox that is merely unable to switch could not run
+        any task using the injected tools.
+        """
+        executor = ExecuteOperation(MagicMock())
+
+        executor._check_for_runuser_error(stderr, "agent")  # does not raise
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "ls: /nope: No such file",
+            "newgrp: cannot set groups: Operation not permitted",
+            "su: cannot set groups: Operation not permitted",
+        ],
+    )
+    def test_unrelated_stderr_is_not_claimed_as_a_runuser_error(
+        self, stderr: str
+    ) -> None:
+        executor = ExecuteOperation(MagicMock())
+
+        executor._check_for_runuser_error(stderr, "agent")  # does not raise
+
+
+def _silent_ws_client() -> WSClient:
+    """A WSClient whose pod never answers: open forever, every poll times out empty."""
+    ws = MagicMock(spec=WSClient)
+    ws.is_open.return_value = True
+
+    def update(timeout: float | None = None) -> None:
+        # The real update() returns after `timeout` seconds with nothing to read.
+        # None would block forever; cap it so a regression cannot wedge the suite.
+        time.sleep(min(timeout if timeout is not None else 60.0, 60.0))
+
+    ws.update.side_effect = update
+    ws.peek_stdout.return_value = False
+    ws.peek_stderr.return_value = False
+    return ws
+
+
+def _finish_within(seconds: float, fn: Callable[[], object]) -> object:
+    """Run fn on a worker thread; fail if it is still waiting after `seconds`."""
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(fn())
+        except BaseException as e:  # noqa: BLE001 - the test inspects the exception
+            outcome.append(e)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        pytest.fail(f"still waiting on a pod that will never answer after {seconds}s")
+    return outcome[0]
+
+
+class TestPodStopsAnswering:
+    """A pod that never reports completion must not hold the worker forever.
+
+    The in-pod `timeout -k 5s Ns` wrapper only fires on a live pod. When the pod is
+    gone the client is the only thing that can end the wait; without its own deadline
+    the worker parks in update(timeout=None) for as long as the process lives.
+    """
+
+    def test_exec_with_timeout_raises_when_the_pod_never_reports_completion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(execute_module, "EXEC_COMPLETION_GRACE_SECONDS", 0.2)
+        monkeypatch.setattr(op_module, "TRANSPORT_POLL_SECONDS", 0.05)
+        executor = ExecuteOperation(MagicMock())
+
+        outcome = _finish_within(
+            5.0,
+            lambda: executor._handle_shell_output(
+                _silent_ws_client(), user=None, timeout=1
+            ),
+        )
+
+        assert isinstance(outcome, TimeoutError)
+        assert "did not report completion" in str(outcome)
+
+    def test_exec_without_timeout_keeps_waiting_past_the_grace_period(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No timeout means the caller asked for an unbounded wait.
+
+        The loop must not invent a deadline of its own.
+        """
+        monkeypatch.setattr(execute_module, "EXEC_COMPLETION_GRACE_SECONDS", 0.1)
+        ws = MagicMock(spec=WSClient)
+        frames = [b"late<completed-sentinel-value-0>"]
+        ws.is_open.side_effect = lambda: bool(frames)
+
+        def update(timeout: float | None = None) -> None:
+            # Silent for longer than the grace period, then the pod answers.
+            time.sleep(0.3)
+
+        ws.update.side_effect = update
+        ws.peek_stderr.return_value = False
+        ws.peek_stdout.side_effect = lambda: bool(frames)
+        ws.read_stdout.side_effect = lambda: frames.pop(0)
+        executor = ExecuteOperation(MagicMock())
+
+        result = executor._handle_shell_output(ws, user=None, timeout=None)
+
+        assert isinstance(result, ExecResult)
+        assert result.returncode == 0
+        assert result.stdout == "late"
