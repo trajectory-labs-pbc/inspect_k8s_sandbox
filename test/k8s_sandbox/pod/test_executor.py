@@ -1,14 +1,19 @@
 import asyncio
 import contextvars
+import json
+import logging
+import math
 import threading
 from time import sleep
 from typing import Generator
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pytest import MonkeyPatch
 
+import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.executor import PodOpExecutor
+from k8s_sandbox._pod.op import PodInfo, PodOperation
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +115,66 @@ async def test_queue_operation_propagates_caller_context(
     seen = await executor.queue_operation(var.get)
 
     assert seen == "override"
+
+
+async def test_slow_operation_logs_stream_setup_and_command_durations(
+    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    executor = PodOpExecutor.get_instance(max_pod_ops=1)
+    # Force every operation over the slow threshold so the WARNING path is exercised.
+    monkeypatch.setattr(executor, "_slow_op_seconds", 0.0)
+    websocket = MagicMock()
+    operation = PodOperation(
+        PodInfo(
+            name="pod",
+            namespace="namespace",
+            context_name=None,
+            default_container_name="container",
+            uid="uid",
+            initial_restart_count=0,
+            restarted_container_behavior="raise",
+        )
+    )
+    monkeypatch.setattr(op_module, "k8s_client", MagicMock())
+    stream_factory = MagicMock(return_value=websocket)
+    monkeypatch.setattr(op_module, "stream", stream_factory)
+    # Upstream runs keepalive on a daemon thread rather than a registry; stub the
+    # worker so the test never opens a real socket write path.
+    keepalive_worker = MagicMock()
+    monkeypatch.setattr(op_module, "_send_keepalive", keepalive_worker)
+    monkeypatch.setattr(operation, "_discard_duplicate_channel", MagicMock())
+
+    def execute_stream() -> None:
+        websocket_stream = operation.create_websocket_client_for_exec(command=["true"])
+        next(websocket_stream)
+        sleep(0.01)
+        websocket_stream.close()
+
+    caplog.set_level(logging.WARNING, logger="k8s_sandbox._logger")
+
+    await executor.queue_operation(execute_stream)
+
+    slow_operation = next(
+        record for record in caplog.records if "Slow pod operation." in record.message
+    )
+    _, serialized_fields = slow_operation.message.split(
+        "Slow pod operation. ", maxsplit=1
+    )
+    fields = json.loads(serialized_fields)
+
+    assert stream_factory.called
+    assert keepalive_worker.called
+    assert websocket.close.called
+    connect_seconds = float(fields["connect_s"])
+    command_seconds = float(fields["command_s"])
+    call_seconds = float(fields["call_s"])
+    assert connect_seconds >= 0
+    assert command_seconds >= 0
+    assert math.isclose(
+        connect_seconds + command_seconds,
+        call_seconds,
+        abs_tol=0.01,
+    )
 
 
 def _synchronous_operation(value: int) -> tuple[int, str]:
