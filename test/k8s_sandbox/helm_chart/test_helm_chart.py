@@ -31,6 +31,12 @@ def test_default_chart(chart_dir: Path) -> None:
     assert services[0]["spec"]["template"]["metadata"]["labels"][
         "aisi.gov.uk/k8s-sandbox-version"
     ] == _chart_version(chart_dir)
+    default_container = next(
+        c
+        for c in services[0]["spec"]["template"]["spec"]["containers"]
+        if c["name"] == "default"
+    )
+    assert default_container["command"] == ["tail", "-f", "/dev/null"]
 
 
 def test_additional_resources(chart_dir: Path, test_resources_dir: Path) -> None:
@@ -551,6 +557,26 @@ def test_rejects_names_that_can_inject_rendered_configuration(
     assert "values don't meet the specifications of the schema" in excinfo.value.stderr
 
 
+def test_default_deny_ingress_selects_every_pod(chart_dir: Path) -> None:
+    documents = _run_helm_template(chart_dir)
+
+    cnps = _get_documents(documents, "CiliumNetworkPolicy")
+    default_deny = next(
+        cnp
+        for cnp in cnps
+        if cnp["metadata"]["name"].endswith("-sandbox-default-deny-ingress")
+    )
+
+    # Release-wide selector, not per-service: no inspect/service label, so this
+    # selects every sandbox pod (isolated or not).
+    match_labels = default_deny["spec"]["endpointSelector"]["matchLabels"]
+    assert "inspect/service" not in match_labels
+
+    # An empty ingress rule enables default-deny while allowing nothing -- this is
+    # the shape the whole subtractive-isolation model rests on.
+    assert default_deny["spec"]["ingress"] == [{}]
+
+
 def test_network_isolated_service(chart_dir: Path, test_resources_dir: Path) -> None:
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "network-isolated-values.yaml"
@@ -558,29 +584,45 @@ def test_network_isolated_service(chart_dir: Path, test_resources_dir: Path) -> 
 
     cnps = _get_documents(documents, "CiliumNetworkPolicy")
 
-    # Verify isolate-service has isolate policy
-    isolate_policy = next(
-        (cnp for cnp in cnps if cnp["metadata"]["name"].endswith("-isolate")), None
-    )
-    assert isolate_policy is not None
-    assert (
-        isolate_policy["metadata"]["name"]
-        == "agent-env-my-release-svc-isolated-service-isolate"
-    )
-    # ingressDeny and egressDeny deny all traffic from/to all entities
-    assert isolate_policy["spec"]["ingressDeny"] == [{"fromEntities": ["all"]}]
-    assert isolate_policy["spec"]["egressDeny"] == [{"toEntities": ["all"]}]
+    _assert_isolated(cnps, "isolated-service")
 
-    # Verify normal-service doesn't have isolate policy
+    # Verify normal-service doesn't have isolate policy, and still gets its ingress
+    # allow.
     normal_service_policies = [
         cnp for cnp in cnps if "normal-service" in cnp["metadata"]["name"]
     ]
     assert len(normal_service_policies) == 1
     assert "isolate" not in normal_service_policies[0]["metadata"]["name"]
+    assert normal_service_policies[0]["metadata"]["name"].endswith(
+        "-svc-normal-service-ingress"
+    )
 
-    normal_spec = normal_service_policies[0]["spec"]
-    assert normal_spec.get("ingress") != []
-    assert normal_spec.get("egress") != []
+    assert normal_service_policies[0]["spec"]["ingress"]
+
+
+def test_network_isolated_service_joining_a_global_network(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    # A service can be networkIsolated and still list `networks` (nothing in the chart
+    # rejects the combination), which renders through the .Values.networks branch
+    # rather than the no-networks branch covered by test_network_isolated_service. That
+    # branch's per-network ingress allow must also be skipped for an isolated service.
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "network-isolated-with-global-network-values.yaml",
+    )
+
+    cnps = _get_documents(documents, "CiliumNetworkPolicy")
+
+    _assert_isolated(cnps, "isolated-service")
+
+    normal_ingress_policies = [
+        cnp
+        for cnp in cnps
+        if cnp["metadata"]["name"].endswith("-svc-normal-service-tasknet-ingress")
+    ]
+    assert len(normal_ingress_policies) == 1
+    assert normal_ingress_policies[0]["spec"]["ingress"] != []
 
 
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
@@ -702,7 +744,7 @@ def test_allow_domains_ports_rejects_unlisted_scope_domain(
         )
 
 
-def test_allow_domains_wildcard_all_skips_identity_enforcement(
+def test_allow_domains_wildcard_all_becomes_a_world_entity_grant(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
     documents = _run_helm_template(
@@ -714,12 +756,51 @@ def test_allow_domains_wildcard_all_skips_identity_enforcement(
         for cnp in _get_documents(documents, "CiliumNetworkPolicy")
         if cnp["metadata"]["name"].endswith("-sandbox-egress")
     )["spec"]["egress"]
-    fqdn_rule = next(r for r in egress if "toFQDNs" in r)
 
-    # "*" (allow all) has no valid serverNames form, so no identity-enforcing
-    # toPorts is emitted -- egress to all resolved IPs is permitted on all ports.
-    assert [m["matchPattern"] for m in fqdn_rule["toFQDNs"]] == ["*"]
-    assert "toPorts" not in fqdn_rule
+    # A `matchPattern: "*"` toFQDNs selector claims every name any sandbox on the
+    # node resolves, re-allocating the shared per-IP identity and permanently
+    # breaking egress for sandboxes that named a specific domain. "*" is the
+    # `world` entity, so render it as one: the grant is unchanged and no FQDN
+    # selector exists to evict anyone.
+    assert [r for r in egress if "toFQDNs" in r] == []
+    assert [r for r in egress if "toEntities" in r] == [{"toEntities": ["world"]}]
+
+    # DNS still resolves any name, or the grant would be unusable.
+    dns = [
+        entry["matchPattern"]
+        for rule in egress
+        for tp in rule.get("toPorts", [])
+        for entry in (tp.get("rules", {}) or {}).get("dns", []) or []
+    ]
+    assert "*" in dns
+
+
+def test_allow_domains_wildcard_all_with_world_entity_grants_world_once(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "allow-domains-wildcard-all-with-world-values.yaml",
+    )
+
+    egress = next(
+        cnp
+        for cnp in _get_documents(documents, "CiliumNetworkPolicy")
+        if cnp["metadata"]["name"].endswith("-sandbox-egress")
+    )["spec"]["egress"]
+
+    # Naming the whole internet twice must not produce two grants, and must still
+    # produce no toFQDNs selector.
+    assert [r for r in egress if "toFQDNs" in r] == []
+    assert [r for r in egress if "toEntities" in r] == [{"toEntities": ["world"]}]
+
+    dns = [
+        entry["matchPattern"]
+        for rule in egress
+        for tp in rule.get("toPorts", [])
+        for entry in (tp.get("rules", {}) or {}).get("dns", []) or []
+    ]
+    assert dns.count("*") == 1
 
 
 def test_service_args_render_as_a_list(
@@ -738,6 +819,27 @@ def test_service_args_render_as_a_list(
     # four the caller asked for, so assert on the parsed list, not a substring.
     assert container["args"] == ["setarch", "-R", "/bin/echo", "hello"]
     assert container["command"] == ["/bin/sh", "-c"]
+
+
+def test_service_command_null_omits_entrypoint(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    # Compose `command:` without `entrypoint:` is converted to `command: null`
+    # plus `args`. Helm must delete the chart-default `tail -f /dev/null` so the
+    # image ENTRYPOINT runs with the user's args as CMD.
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "service-command-null-values.yaml"
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    container = next(c for c in pod_spec["containers"] if c["name"] == "default")
+
+    assert "command" not in container
+    assert container["args"] == [
+        "sh",
+        "-c",
+        "touch /tmp/i-ran && tail -f /dev/null",
+    ]
 
 
 def _run_helm_template(
@@ -769,6 +871,49 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -> bool:
+    """Whether an endpointSelector's matchLabels selects `service_name`'s pod.
+
+    It selects the pod if it carries no inspect/service label (release-wide, e.g.
+    sandbox-default-deny-ingress) or if that label names this service.
+    """
+    service_label = match_labels.get("inspect/service")
+    return service_label is None or service_label == service_name
+
+
+def _assert_isolated(cnps: list[dict[str, Any]], service_name: str) -> None:
+    """Assert `service_name` is fully network-isolated.
+
+    Its isolate policy denies egress (without an ingressDeny, which would shadow a
+    layered-on allow), and -- walking every rendered policy by selector rather than
+    by name, so a stray allow under an unexpected name can't hide -- the only
+    ingress-bearing policy that selects it is the release-wide
+    sandbox-default-deny-ingress.
+    """
+    isolate_policy = next(
+        (
+            cnp
+            for cnp in cnps
+            if cnp["metadata"]["name"].endswith(f"-svc-{service_name}-isolate")
+        ),
+        None,
+    )
+    assert isolate_policy is not None
+    assert "ingressDeny" not in isolate_policy["spec"]
+    assert isolate_policy["spec"]["egressDeny"] == [{"toEntities": ["all"]}]
+
+    selecting_policies = [
+        cnp["metadata"]["name"]
+        for cnp in cnps
+        if "ingress" in cnp["spec"]
+        and _selector_matches_service(
+            cnp["spec"]["endpointSelector"]["matchLabels"], service_name
+        )
+    ]
+    assert len(selecting_policies) == 1
+    assert selecting_policies[0].endswith("-sandbox-default-deny-ingress")
 
 
 def _chart_version(chart_dir: Path) -> str:

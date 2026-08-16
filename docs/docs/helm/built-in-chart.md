@@ -171,6 +171,13 @@ access to other ports and protocols. Wildcard subdomains (e.g.  `*.aisi.org`) re
 [SNI limiting](https://docs.cilium.io/en/latest/security/policy/layer4/#limit-tls-server-name-indication-sni)
 (see Domain Fronting below).
 
+`allowDomains: ["*"]` means "the whole internet" and is rendered as a Cilium `world`
+entity grant, not as a `toFQDNs` pattern. A wildcard pattern would claim every name
+resolved anywhere on the node and revoke the egress of concurrent sandboxes that named
+specific domains — see
+[FQDN identity contention](../design/limitations.md#fqdn-identity-contention) for the
+cases that still contend.
+
 #### Domain Fronting
 
 [Domain Fronting](https://www.zscaler.com/blogs/security-research/analysis-domain-fronting-technique-abuse-and-hiding-cdns) can be leveraged to circumvent cillium networking constraints. In order to avoid this threat:
@@ -432,6 +439,15 @@ volumes:
         requests:
           storage: 1Gi
 ```
+
+### Kubernetes Volume Types
+
+Compose shorthand covers named volumes. For Kubernetes volume types it cannot express,
+such as OCI image volumes, use the per-service `x-inspect_k8s_sandbox.volumes` and
+`volumeMounts` extensions. Their list entries are passed to the chart verbatim and are
+appended after volumes derived from ordinary Compose shorthand. See [Compose to
+Helm](compose-to-helm.md#kubernetes-volume-types) for the full example and Kubernetes
+API requirements.
 
 ## Networks
 
