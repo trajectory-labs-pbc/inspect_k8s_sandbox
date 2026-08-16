@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Add per-service `x-inspect_k8s_sandbox.volumes` and `volumeMounts` compose
+  extensions for Kubernetes volume types, including OCI image volumes, that Compose
+  shorthand cannot express.
+- `INSPECT_POD_RESTART_CHECK=false` skips the pre-operation pod read inside
+  `read_file()` / `write_file()`, for deployments where that per-op
+  `read_namespaced_pod` call becomes a load problem on the Kubernetes API server at
+  high concurrency. Defaults to enabled, so behaviour is unchanged unless set.
+  `exec()` always performs the check regardless.
+- `network_mode: none` isolation is now enforced by omitting any ingress allow for the
+  service rather than an unconditional ingress deny. Observable behaviour is unchanged
+  for a chart used on its own, but a network policy layered on top of this chart (e.g.
+  to allow a specific port) now takes effect instead of being silently shadowed.
+- An `exec` whose pod stops answering now fails with `TimeoutError` once its
+  `timeout` plus a 30s grace has passed, and a `read_file` that receives no data
+  for 60s fails with `PodError`, instead of waiting forever. Previously a pod
+  that died mid-command left the operation, and any eval waiting on it, hung
+  until the process was killed.
+- Cancelling a sandbox operation (e.g. an eval timing out or being interrupted) now closes its connection and waits for its worker to finish, instead of leaving a thread blocked on the pod. Cancellation of such an operation can therefore take up to 30 seconds longer to unwind while the worker settles. Previously that thread held a slot in the shared pod-operation pool so the next operation could not start, kept the process from exiting, and could write into a `read_file` destination that had already been closed (`ValueError: write to closed file`).
 - **BREAKING CHANGE**: The CoreDNS sidecar now runs as UID/GID 65532 on a read-only root
   filesystem with only `NET_BIND_SERVICE`. A custom `corednsImage` must run under that
   context; set the new `corednsSecurityContext` if it cannot. The default image moves
@@ -14,6 +32,17 @@
 - Raise an error when a conflicting `max_pod_ops` setting would otherwise be ignored.
 - Fix a service's `args` (compose `command:`) reaching the container as a single
   space-joined string instead of a list.
+- `exec(user=...)` no longer wraps the shell in `runuser` when the container is already
+  running as that user. `runuser` calls `setgroups(2)`, which needs `CAP_SETGID` even
+  for a root -> root switch, so the unconditional wrapper made every `exec(user=...)`
+  fail in a container whose capabilities had been dropped. On that path the process
+  environment is the container's rather than one `runuser` has reset (`HOME`, `USER`,
+  supplementary groups). A container that cannot switch users at all -- non-root, no
+  `CAP_SETGID`, or no `runuser` installed -- is now logged as a warning and returned as
+  a failed `ExecResult` rather than raised, so a caller that probes with a user and
+  falls back (as inspect-ai does when injecting its sandbox tools) can do so. Naming a
+  user that does not exist still raises.
+- Fix startup failing with `... is not valid SemVer string`.
 
 ## 2026-08-12 0.13.0
 

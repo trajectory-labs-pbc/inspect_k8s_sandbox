@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
 
@@ -10,13 +11,22 @@ from inspect_ai.util import ExecResult
 from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import PodInfo, PodOperation, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+def _file_op_restart_check_enabled() -> bool:
+    # Gates the pre-op `read_namespaced_pod` call inside read_file / write_file
+    # (only — exec is unaffected and always checks). At high concurrency
+    # (200+ ops) the per-op reads can overwhelm the K8s API server; exec's
+    # check is the high-signal way we learn a sandbox pod was replaced and
+    # stays unconditional, while file-op API errors are self-revealing.
+    return os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() != "false"
 
 
 class Pod:
@@ -146,7 +156,7 @@ class Pod:
         warned_restart = await self.check_for_pod_restart()
         executor = ExecuteOperation(self._info)
         result = await self._run_async(
-            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout)
+            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout), executor
         )
         if not result.success:
             if warned_restart is not None:
@@ -179,9 +189,10 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        await self.check_for_pod_restart()
+        if _file_op_restart_check_enabled():
+            await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
-        await self._run_async(lambda: writer.write_file(data, dst))
+        await self._run_async(lambda: writer.write_file(data, dst), writer)
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
         """
@@ -195,11 +206,21 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        await self.check_for_pod_restart()
+        if _file_op_restart_check_enabled():
+            await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
-        await self._run_async(lambda: reader.read_file(src, dst))
+        await self._run_async(lambda: reader.read_file(src, dst), reader)
 
-    async def _run_async(self, callable: Callable[[], T]) -> T:
-        """Run a synchronous function asynchronously."""
+    async def _run_async(
+        self, callable: Callable[[], T], operation: PodOperation | None = None
+    ) -> T:
+        """Run a synchronous function asynchronously.
+
+        `operation` lets a cancelled caller close that operation's transport so
+        its worker thread finishes instead of holding a pool slot, blocking
+        interpreter exit, or writing into a destination the caller has disposed.
+        """
         executor = PodOpExecutor.get_instance()
-        return await executor.queue_operation(callable)
+        return await executor.queue_operation(
+            callable, on_cancel=operation.close_transport if operation else None
+        )
