@@ -1,18 +1,7 @@
-"""Regression test: a None frame from the exec websocket must not crash.
+"""Exercise exec output handling when a websocket-like client returns None.
 
-`peek_*()` and `read_*()` on the WSClient may both call `update()`, so an
-intervening update can drain a channel between a truthy peek and the read. The
-read then returns None. Decoding it raised AttributeError inside the exec path,
-surfacing to callers as an opaque
-
-    Error executing command in Pod. {"cause": "'NoneType' object has no
-    attribute 'decode'"}
-
-Measured across ten concurrent eval arms over ~6h: 37-122 such events per 1000
-model calls, worst arm 1493 / 12222 calls.
-
-These drive the REAL read loop (`_handle_shell_output`) with a stub client that
-reproduces the race, rather than asserting on the source text of the guard.
+The stub presents a truthy peek followed by None from read. This documents the
+behavioral precondition exercised by these tests.
 """
 
 import json
@@ -24,10 +13,9 @@ from k8s_sandbox._pod.execute import COMPLETED_SENTINEL, ExecuteOperation
 
 
 class _RaceyWSClient:
-    """Reproduces None-after-truthy-peek on whichever channel is selected.
+    """Stub whose scripted reads can return None after truthy peeks.
 
-    Frame script per channel: each entry is either bytes (returned) or None
-    (the race -- peek said data was available, the read finds none).
+    Frame script per channel: each entry is either bytes or None.
     """
 
     def __init__(
@@ -88,7 +76,7 @@ def _sentinel_frame(returncode: int = 0) -> bytes:
 
 
 def test_none_stdout_frame_does_not_raise_attributeerror() -> None:
-    """The exact production race: peek truthy, read returns None."""
+    """A None stdout read does not raise AttributeError."""
     client = _RaceyWSClient(
         stdout_frames=[b"hello ", None, b"world", _sentinel_frame(0)]
     )
@@ -96,10 +84,7 @@ def test_none_stdout_frame_does_not_raise_attributeerror() -> None:
     try:
         result = _run(client)
     except AttributeError as e:  # pragma: no cover - this is the bug
-        pytest.fail(
-            f"None stdout frame reached the decoder: {e}. This is the "
-            "'NoneType' object has no attribute 'decode' production failure."
-        )
+        pytest.fail(f"None stdout frame reached the decoder: {e}.")
 
     assert "hello" in result.stdout
     assert "world" in result.stdout, "output either side of the None must survive"
@@ -120,7 +105,7 @@ def test_none_stderr_frame_does_not_poison_the_buffer() -> None:
 
 
 def test_all_none_stdout_frames_still_terminate() -> None:
-    """A channel that only ever yields None must not spin or crash."""
+    """A channel that only yields None terminates without spinning or crashing."""
     client = _RaceyWSClient(stdout_frames=[None, None, _sentinel_frame(3)])
     client.returncode = 3
 
