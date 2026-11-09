@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add per-service `x-inspect_k8s_sandbox.volumes` and `volumeMounts` compose
+  extensions for Kubernetes volume types, including OCI image volumes, that Compose
+  shorthand cannot express.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
