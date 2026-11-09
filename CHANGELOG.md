@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Over Kubernetes exec (a pod without execd), `exec()`, `read_file()` and
+  `write_file()` calls that take 5s or longer, including the command's own run time,
+  log a `Slow pod operation.` WARNING that splits the time between waiting for a
+  pod-operation slot (`INSPECT_MAX_POD_OPS`), connecting to the pod and running the
+  command.
 - `read_file()` and `write_file()` take a keyword-only `user`, as Inspect 0.3.286 asks
   of a sandbox provider: the file is read or written, and a write's directories made, as
   that user, through `runuser` over Kubernetes exec and by execd on a pod with execd.

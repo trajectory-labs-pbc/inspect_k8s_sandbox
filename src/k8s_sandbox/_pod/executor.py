@@ -4,14 +4,19 @@ import asyncio
 import contextvars
 import os
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, TypeVar
 
 from inspect_ai.util import concurrency
 
-from k8s_sandbox._logger import log_debug
+from k8s_sandbox._logger import log_debug, log_warn
+from k8s_sandbox._pod.timing import POD_OPERATION_TIMING, PodOperationTiming
 
 T = TypeVar("T")
+
+# Seconds at or above which a pod operation is logged at WARNING, not DEBUG.
+_SLOW_OP_SECONDS = 5.0
 
 
 class PodOpExecutor:
@@ -49,6 +54,11 @@ class PodOpExecutor:
         self._executor = ThreadPoolExecutor(
             max_workers=self._max_workers, thread_name_prefix="pod-op-executor"
         )
+        # Instrumentation counters. Only ever mutated from the event loop (never
+        # from a worker thread), so they need no lock.
+        self._waiting = 0
+        self._running = 0
+        self._slow_op_seconds = _SLOW_OP_SECONDS
 
     @classmethod
     def get_instance(cls, max_pod_ops: int | None = None) -> PodOpExecutor:
@@ -94,22 +104,105 @@ class PodOpExecutor:
         on a new thread, so that a result holding an open connection is closed rather
         than left to the garbage collector.
 
+        Records how long the operation spent in each stage so that a slow operation
+        can be attributed: waiting for the semaphore, waiting for a free worker
+        thread, or in the Kubernetes call itself.
+
         This method is async-safe but not thread-safe.
         """
+        submitted_at = time.monotonic()
+        self._waiting += 1
+        acquired = False
         future: Future[T] | None = None
         try:
             async with concurrency("pod-op", self._max_workers):
+                self._waiting -= 1
+                acquired = True
+                acquired_at = time.monotonic()
+                queued = self._waiting
+                self._running += 1
                 # The executor does not propagate the caller's context into the
                 # worker thread, so pass it directly to preserve Inspect
                 # sandbox config overrides
                 context = contextvars.copy_context()
-                future = self._executor.submit(context.run, callable)
-                return await asyncio.wrap_future(future)
+                started_at: float | None = None
+
+                def run_op() -> T:
+                    nonlocal started_at
+                    started_at = time.monotonic()
+                    _ = context.run(POD_OPERATION_TIMING.set, None)
+                    return context.run(callable)
+
+                try:
+                    future = self._executor.submit(run_op)
+                    return await asyncio.wrap_future(future)
+                finally:
+                    finished_at = time.monotonic()
+                    running = self._running
+                    self._running -= 1
+                    pod_operation_timing = context.get(POD_OPERATION_TIMING)
+                    self._log_op_timing(
+                        submitted_at=submitted_at,
+                        acquired_at=acquired_at,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        queued=queued,
+                        running=running,
+                        pod_operation_timing=pod_operation_timing,
+                    )
         except BaseException:
             if discard is not None and future is not None:
                 # Runs once: now if the result is already in, else when it is.
                 future.add_done_callback(lambda done: _discard(done, discard))
             raise
+        finally:
+            if not acquired:
+                self._waiting -= 1
+
+    def _log_op_timing(
+        self,
+        *,
+        submitted_at: float,
+        acquired_at: float,
+        started_at: float | None,
+        finished_at: float,
+        queued: int,
+        running: int,
+        pod_operation_timing: PodOperationTiming | None,
+    ) -> None:
+        total = finished_at - submitted_at
+        fields: dict[str, object] = {
+            "total_s": round(total, 3),
+            # Time blocked on the pod-op semaphore: high means the concurrency
+            # limit is the constraint.
+            "semaphore_wait_s": round(acquired_at - submitted_at, 3),
+            # Time between submitting to the thread pool and the callable actually
+            # starting: high means every worker thread is busy.
+            "dispatch_wait_s": (
+                round(started_at - acquired_at, 3) if started_at is not None else None
+            ),
+            # Time in the synchronous Kubernetes call itself.
+            "call_s": (
+                round(finished_at - started_at, 3) if started_at is not None else None
+            ),
+            "connect_s": (
+                round(pod_operation_timing.connect_s, 3)
+                if pod_operation_timing is not None
+                else None
+            ),
+            "command_s": (
+                round(pod_operation_timing.command_s, 3)
+                if pod_operation_timing is not None
+                else None
+            ),
+            "queued": queued,
+            "running": running,
+            "max_workers": self._max_workers,
+        }
+        if total >= self._slow_op_seconds:
+            log_warn("Slow pod operation.", **fields)
+        else:
+            log_debug("Pod operation timing.", **fields)
 
 
 def _discard(future: Future[T], discard: Callable[[T], object]) -> None:

@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from abc import ABC
 from dataclasses import dataclass
 from typing import Generator, Literal
@@ -11,6 +12,7 @@ from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
 from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
 from k8s_sandbox._pod.snapshot import read_pod
+from k8s_sandbox._pod.timing import POD_OPERATION_TIMING, PodOperationTiming
 
 # The duration to wait for an initial response from the k8s API server.
 # The initial response is received before the command is necessarily complete, so
@@ -87,6 +89,7 @@ class PodOperation(ABC):
         self, send_keepalive: bool = True, **kwargs
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
+        stream_started_at = time.monotonic()
         # Note: ApiException is intentionally not caught; it should fail the eval.
         ws_client: WSClient = stream(
             client.connect_get_namespaced_pod_exec,
@@ -98,6 +101,7 @@ class PodOperation(ABC):
             _request_timeout=API_TIMEOUT,
             **kwargs,
         )
+        stream_connected_at = time.monotonic()
         stop_keepalive = threading.Event()
         keepalive = threading.Thread(
             target=_send_keepalive,
@@ -118,6 +122,12 @@ class PodOperation(ABC):
             # collector.
             if ws_client.sock:
                 ws_client.sock.shutdown()
+            _ = POD_OPERATION_TIMING.set(
+                PodOperationTiming(
+                    connect_s=stream_connected_at - stream_started_at,
+                    command_s=time.monotonic() - stream_connected_at,
+                )
+            )
 
     def _discard_duplicate_channel(self, ws_client: WSClient) -> None:
         # Avoid issuing a warning multiple times.
