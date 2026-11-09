@@ -2630,3 +2630,76 @@ async def _receiving(stream: PodStdio, max_bytes: int) -> AsyncIterator[bytes]:
             yield await stream.receive(max_bytes)
         except anyio.EndOfStream:
             return
+
+
+def _finish_within(seconds: float, fn: Callable[[], object]) -> object:
+    """Run fn on a worker thread; fail if it is still waiting after `seconds`."""
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(fn())
+        except BaseException as e:  # noqa: BLE001 - the test inspects the exception
+            outcome.append(e)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        pytest.fail(f"still waiting on a pod that will never answer after {seconds}s")
+    return outcome[0]
+
+
+class TestPodStopsAnswering:
+    """A pod that never reports completion must not hold the worker forever.
+
+    The in-pod `timeout -k 5s Ns` wrapper only fires on a live pod. When the pod is
+    gone the client is the only thing that can end the wait; without its own deadline
+    the worker parks in update(timeout=None) for as long as the process lives.
+    """
+
+    def test_exec_with_timeout_raises_when_the_pod_never_reports_completion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(execute_module, "EXEC_COMPLETION_GRACE_SECONDS", 0.2)
+        monkeypatch.setattr(op_module, "TRANSPORT_POLL_SECONDS", 0.05)
+        # Open for ever, and every poll times out empty.
+        silent = _FakeWSClient([], ends=False)
+
+        outcome = _finish_within(5.0, lambda: _handle(silent, timeout=1))
+
+        assert isinstance(outcome, TimeoutError)
+        assert "did not report completion" in str(outcome)
+
+    def test_exec_without_timeout_keeps_waiting_past_the_grace_period(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No timeout means the caller asked for an unbounded wait.
+
+        The loop must not invent a deadline of its own.
+        """
+        monkeypatch.setattr(execute_module, "EXEC_COMPLETION_GRACE_SECONDS", 0.1)
+        # Silent for longer than the grace period, then the pod answers.
+        ws = _FakeWSClient(
+            [0.3, (STDOUT, b"late" + _marker(0)), (STDERR, _marker(0)), _status(0)]
+        )
+
+        result = _handle(ws, timeout=None)
+
+        assert isinstance(result, ExecResult)
+        assert result.returncode == 0
+        assert result.stdout == "late"
+
+    def test_a_command_still_running_within_its_timeout_is_waited_for(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deadline is the timeout plus the grace, not the poll interval."""
+        monkeypatch.setattr(execute_module, "EXEC_COMPLETION_GRACE_SECONDS", 0.2)
+        monkeypatch.setattr(op_module, "TRANSPORT_POLL_SECONDS", 0.05)
+        ws = _FakeWSClient(
+            [0.5, (STDOUT, b"done" + _marker(0)), (STDERR, _marker(0)), _status(0)]
+        )
+
+        result = _handle(ws, timeout=1)
+
+        assert (result.returncode, result.stdout) == (0, "done")

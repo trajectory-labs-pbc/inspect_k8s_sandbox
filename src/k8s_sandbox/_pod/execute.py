@@ -23,6 +23,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import ABNF
 
+import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import (
@@ -45,6 +46,12 @@ COMPLETED_SENTINEL = "completed-sentinel-value"
 # a background process still holds the command's stdout or stderr open.
 STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
+# The in-pod `timeout -k 5s Ns` wrapper is the primary enforcement of an exec's
+# timeout, but it can only fire while the pod is alive. When the pod has gone the
+# stream simply never completes, so the client also enforces `timeout` plus this
+# grace: enough for the wrapper's 5s SIGKILL escalation, the shell's markers, and
+# the API server relaying the final frames.
+EXEC_COMPLETION_GRACE_SECONDS = 30
 # The last line of every exec script, which closes its { } group: see exec().
 _CLOSE_GROUP = "}\n"
 # Kept from an exec_stdio command's stderr, to explain one that failed to start.
@@ -357,14 +364,30 @@ class ExecuteOperation(PodOperation):
             stderr = _MarkedStream(marker)
             # Set once both markers are in: the command has exited.
             deadline: float | None = None
+            # Until then, a command with a timeout must end within it plus a grace.
+            completion = (
+                None
+                if timeout is None
+                else time.monotonic() + timeout + EXEC_COMPLETION_GRACE_SECONDS
+            )
             while ws_client.is_open():
                 wait = None if deadline is None else deadline - time.monotonic()
                 if wait is not None and wait <= 0:
                     break
+                if deadline is None and completion is not None:
+                    remaining = completion - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Command exceeded its {timeout}s timeout and the pod "
+                            f"did not report completion within a further "
+                            f"{EXEC_COMPLETION_GRACE_SECONDS}s; the pod is not "
+                            f"answering."
+                        )
+                    wait = min(remaining, op_module.TRANSPORT_POLL_SECONDS)
                 lost = None
                 try:
-                    # Until both markers are in, `wait` is None and this blocks until
-                    # there is data to read.
+                    # Until both markers are in, `wait` is None for a command with no
+                    # timeout, and this blocks until there is data to read.
                     _update(ws_client, wait)
                 except (OSError, websocket.WebSocketException) as e:
                     lost = e

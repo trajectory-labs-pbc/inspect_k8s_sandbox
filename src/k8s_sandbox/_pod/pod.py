@@ -35,7 +35,12 @@ from k8s_sandbox._pod.execute import (
     PodStdio,
 )
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
+    PodInfo,
+    PodOperation,
+    check_for_pod_restart,
+)
 from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.snapshot import read_pod
 from k8s_sandbox._pod.write import WriteFileOperation
@@ -242,7 +247,8 @@ class Pod:
                 bool(self._switch.get(key)) if user and self._info == info else False
             )
             result = await self._run_async(
-                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
+                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch),
+                operation=executor,
             )
         except ExecResultUnknownError:
             # A container restarted or replaced under the command explains the lost
@@ -329,7 +335,7 @@ class Pod:
         switch = await self._file_user_switch(user)
         writer = WriteFileOperation(self._info)
         await self._after_failure_check(
-            lambda: writer.write_file(data, dst, user, switch)
+            lambda: writer.write_file(data, dst, user, switch), writer
         )
 
     async def read_file(
@@ -354,7 +360,7 @@ class Pod:
         switch = await self._file_user_switch(user)
         reader = ReadFileOperation(self._info)
         await self._after_failure_check(
-            lambda: reader.read_file(src, dst, user, switch)
+            lambda: reader.read_file(src, dst, user, switch), reader
         )
 
     async def _file_user_switch(self, user: str | None) -> bool:
@@ -382,7 +388,9 @@ class Pod:
             )
         return switch
 
-    async def _after_failure_check(self, callable: Callable[[], None]) -> None:
+    async def _after_failure_check(
+        self, callable: Callable[[], None], operation: PodOperation
+    ) -> None:
         """Run a file operation, and in "raise" mode check for a restart if it fails.
 
         Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
@@ -391,7 +399,7 @@ class Pod:
         any retry, as they were.
         """
         try:
-            await self._run_async(callable)
+            await self._run_async(callable, operation=operation)
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
@@ -400,7 +408,10 @@ class Pod:
             raise
 
     async def _run_async(
-        self, callable: Callable[[], T], discard: Callable[[T], object] | None = None
+        self,
+        callable: Callable[[], T],
+        discard: Callable[[T], object] | None = None,
+        operation: PodOperation | None = None,
     ) -> T:
         """Run a synchronous function asynchronously.
 
@@ -409,7 +420,10 @@ class Pod:
         function returned or failed. In "raise" mode a container that stopped under
         the function counts as restarted. DISCARD closes a result the caller won't
         get, such as an open connection: one a restart was found in, or one that came
-        once the caller stopped waiting.
+        once the caller stopped waiting. OPERATION lets a cancelled caller close that
+        operation's transport so its worker thread finishes instead of holding a pool
+        slot, blocking interpreter exit, or writing into a destination the caller has
+        disposed.
         """
 
         def run() -> T:
@@ -441,7 +455,11 @@ class Pod:
             self._raise_restart()
         executor = PodOpExecutor.get_instance()
         try:
-            result = await executor.queue_operation(run, discard=discard)
+            result = await executor.queue_operation(
+                run,
+                discard=discard,
+                on_cancel=operation.close_transport if operation else None,
+            )
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
