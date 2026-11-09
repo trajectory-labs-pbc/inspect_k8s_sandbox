@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add per-service `x-inspect_k8s_sandbox.volumes` and `volumeMounts` compose
+  extensions for Kubernetes volume types, including OCI image volumes, that Compose
+  shorthand cannot express.
 - `read_file()` and `write_file()` take a keyword-only `user`, as Inspect 0.3.286 asks
   of a sandbox provider: the file is read or written, and a write's directories made, as
   that user, through `runuser` over Kubernetes exec and by execd on a pod with execd.
