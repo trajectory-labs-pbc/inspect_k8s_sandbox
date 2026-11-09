@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `exec()`, `read_file()` and `write_file()` calls that take 5s or longer, including
+  the command's own run time, log a `Slow pod operation.` WARNING that splits the time
+  between waiting for a pod-operation slot (`INSPECT_MAX_POD_OPS`), connecting to the
+  pod and running the command.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
