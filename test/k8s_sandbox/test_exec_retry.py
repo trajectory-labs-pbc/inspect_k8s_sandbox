@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
@@ -9,9 +10,13 @@ from tenacity import wait_none
 
 from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecdResultUnknownError,
+    ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
+    PodReplacedError,
 )
 from k8s_sandbox._sandbox_environment import (
     K8sError,
@@ -109,6 +114,10 @@ class TestExecRetryTransient:
                 GetReturncodeError("no return code"),
                 id="GetReturncodeError",
             ),
+            pytest.param(
+                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                id="ExecResultUnknownError",
+            ),
         ],
     )
     async def test_transient_error_is_retried(self, error: Exception) -> None:
@@ -155,6 +164,11 @@ class TestExecRetryPermanent:
                 PermissionError("permission denied"),
                 PermissionError,
                 id="PermissionError",
+            ),
+            pytest.param(
+                ExecdResultUnknownError("execd stopped", pod="test-pod"),
+                K8sError,
+                id="ExecdResultUnknownError",
             ),
         ],
     )
@@ -217,7 +231,7 @@ def _read_file_side_effect(error: Exception, content: bytes = b"file-content"):
     """Return a side_effect that fails once then writes content to dst."""
     calls = 0
 
-    async def impl(src: Path, dst):
+    async def impl(src: Path, dst, user=None):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -278,6 +292,16 @@ class TestReadFileRetryPermanent:
         mock_read.side_effect = FileNotFoundError("no such file")
 
         with pytest.raises(FileNotFoundError):
+            await sandbox.read_file("/tmp/test.txt")
+
+        assert mock_read.call_count == 1
+
+    async def test_stopped_container_not_retried(self) -> None:
+        # A retry would read from the container that replaces it.
+        sandbox, mock_read = _make_sandbox_with_mock_read()
+        mock_read.side_effect = ContainerStoppedError("stopped")
+
+        with pytest.raises(K8sError):
             await sandbox.read_file("/tmp/test.txt")
 
         assert mock_read.call_count == 1
@@ -365,3 +389,80 @@ class TestWriteFileRetryExhausted:
             await sandbox.write_file("/tmp/test.txt", "hello")
 
         assert mock_write.call_count == 5
+
+
+# -- exec_stdio retry tests --
+
+
+class TestExecStdioRetry:
+    """Opening is retried as exec() is, and runs as the default user unless told."""
+
+    async def test_transient_error_is_retried(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = MagicMock()
+        mock_pod.exec_stdio = AsyncMock(
+            side_effect=[ApiException(status=503, reason="Unavailable"), stream]
+        )
+
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 2
+        assert opened is stream
+
+    async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
+        """Nothing checks the pod again while the stream lasts."""
+        sandbox, mock_pod = _make_sandbox()
+        stream = AsyncMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(
+            side_effect=PodReplacedError(
+                pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
+            )
+        )
+
+        with pytest.raises(K8sError) as error:
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert isinstance(error.value.__cause__, PodReplacedError)
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = AsyncMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(side_effect=anyio.Event().wait)
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools"])
+                await anyio.wait_all_tasks_blocked()
+                tasks.cancel_scope.cancel()
+
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = MagicMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(
+            side_effect=[ApiException(status=503, reason="Unavailable"), None]
+        )
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 1
+
+    @pytest.mark.parametrize("user, expected", [(None, "agent"), ("root", "root")])
+    async def test_the_default_user_is_used_unless_one_is_given(
+        self, user: str | None, expected: str
+    ) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        sandbox._config = MagicMock(default_user="agent")
+        mock_pod.exec_stdio = AsyncMock()
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
+
+        assert mock_pod.exec_stdio.call_args.args == (
+            ["inspect-sandbox-tools", "bridge"],
+            expected,
+        )

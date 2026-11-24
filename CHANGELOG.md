@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `read_file()` and `write_file()` take a keyword-only `user`, as Inspect 0.3.286 asks
+  of a sandbox provider: the file is read or written, and a write's directories made, as
+  that user, through `runuser` over Kubernetes exec and by execd on a pod with execd.
+  `root` and `0` mean uid 0, as for `exec()`. A user the container cannot run as raises
+  `SandboxUserUnsupportedError` before anything is read or written. With no `user`, file
+  operations run as the container's user, as before. Requires Inspect 0.3.275, the first
+  with that error, and Python 3.11. See
+  [limitations](https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user).
+- Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
+  runtime whose node must stop a deleted Pod before another Pod takes its room.
+- A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
+  mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
+  at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
+  TLS to execd instead of Kubernetes exec stdin, each command started by the image's
+  `/bin/sh` as its user: a command name that starts with `-` is not found, and a bash
+  there reads a `SHELLOPTS` in the command's environment as its own. There, a timed-out
+  `exec()` whose command is still running gets SIGKILL at once, not SIGTERM, and so do
+  its background processes; those of a command that has ended are left running, by a
+  closed `exec_stdio()` too. One that leaves the command's process group survives if it
+  keeps starting new processes, clears its environment or pads it past 8 MiB or, without
+  `CAP_SYS_PTRACE`, makes itself non-dumpable or changes user; on gVisor it also survives
+  if its command ran as another `user`. On gVisor that user's other processes can't open
+  such a command's `/proc/PID/fd`. A pod with no PID to spare can end execd itself, and a
+  command run as another `user` needs up to four to start. Make execd mode 111. A process
+  running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in for
+  it while it starts, as it could already forge a result under `kubectl exec`. What a pod's execd sends is paced
+  at 4,096 frames and 128 MiB a second.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
@@ -14,6 +41,71 @@
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
 - Add a `priorityClassName` value for the sandbox pods' PriorityClass. It is a cluster
   setting, so set it in the `INSPECT_SANDBOX_VALUES` file.
+- With `restarted_container_behavior="raise"`, every operation after a detected pod
+  replacement or container restart fails with the same `PodReplacedError` or
+  `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
+  it was detected. `read_file()` and `write_file()` do too when
+  `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
+  waiting to start again, counts as restarted.
+- With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` that
+  fails checks whether the container restarted or the pod was replaced, also when
+  `INSPECT_POD_RESTART_CHECK=false`, and raises that instead. Otherwise its error stands,
+  and a connection error is still retried. Each check costs one pod read.
+- The pod read that checks for a restart gives up when the API server sends nothing for
+  60 seconds (the kubernetes client tries up to four times), and the operation then
+  fails, instead of waiting on a stalled API server without end. A server that keeps
+  sending, however slowly, is still waited on.
+- An operation whose container stopped under it, which Kata reports with exit code 255
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`, also
+  when the connection is lost after the client read that status.
+  Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
+  `write_file()` were retried, reaching the container that replaced it. With
+  `restarted_container_behavior="raise"`, or for an `exec()` whose check after it sees
+  the restart, it raises `ContainerRestartedError` instead.
+- Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
+  before it finished, with exit code `N`, and that marker being left at the end of
+  stdout when it arrived in two pieces. `exec()` of a command that leaves a
+  background process holding its stdout or stderr open now returns a tenth of a
+  second after the command exits, rather than at once.
+- `exec()` no longer returns a successful result whose output lost its end on the way.
+  That, and a connection to the pod lost while the command runs, raise
+  `ExecResultUnknownError` (as the cause of a `K8sError`), a `GetReturncodeError` that is
+  retried as before, so the command may run a second time; or, if the container
+  restarted or was replaced meanwhile, that error, which is not retried. A pod with
+  execd resumes the command instead, and never runs it a second time.
+- `exec()` runs fewer programs in the container per call, which makes it faster
+  where starting one is slow. Images no longer need `sync`, and need `printf` (a
+  shell builtin in dash, bash and busybox).
+- `exec(user=...)` runs fewer programs per call after its first call as each user,
+  where the container switches to that user.
+- Add a per-service `podAnnotations` value: annotations for that service's Pod
+  alone, over the top-level `annotations`, for a runtime that reads per-pod
+  settings from annotations.
+- Fix an exec's input (such as a large `write_file()`, which streams over the exec's
+  stdin) going unread after about a minute with the `kubernetes` Python client 36 or
+  later.
+- Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
+  `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
+  taking one each. Needs anyio 4.14 or later. With
+  `restarted_container_behavior="raise"`, `exec_stdio()` raises a detected restart
+  before starting its command, as `exec()` does, and a stream already open raises
+  `anyio.BrokenResourceError` at its next `receive()` or `send()` once a restart is
+  found. In that mode, when its stream ends with exit code 255 after the
+  command wrote stdout (Kata's status for a command whose VM stopped), the stream ends
+  as usual and every later operation fails as after a detected restart. The command
+  must not exit 255 itself once it has written.
+- `exec(user="root")` no longer needs `id` or `runuser` in the image, and is faster
+  where starting a program is slow. In a container that is not root,
+  `exec(user="0")` now fails as `exec(user="root")` does, with a warning, rather
+  than raising a `RuntimeError` that says the user does not exist.
+- `exec()`, `read_file()` and `write_file()` no longer find the programs they run
+  besides the caller's command through the image's `PATH`: `exec(user=...)` runs
+  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
+  `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
+  them there. The caller's command still
+  runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.
+- The task name and sample UUID reach the chart verbatim, as strings, whatever
+  characters they contain (a comma, `=`, a leading `{`, or a name such as `123`).
 
 ## 2026-10-09 0.14.0
 

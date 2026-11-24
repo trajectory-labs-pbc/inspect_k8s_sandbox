@@ -175,6 +175,66 @@ def test_annotations(chart_dir: Path, test_resources_dir: Path) -> None:
         assert deployment["metadata"]["annotations"]["myValue"] == attr_value
 
 
+def test_pod_annotations_reach_only_their_service_pod(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "annotations.shared=release,annotations.both=release,"
+        "services.default.dnsRecord=true,services.server.dnsRecord=true,"
+        "services.default.podAnnotations.both=default,"
+        "services.default.podAnnotations.mine=default,"
+        "services.server.podAnnotations.mine=server",
+    )
+
+    release = {"shared": "release", "both": "release"}
+    pods = {}
+    for stateful_set in _get_documents(documents, "StatefulSet"):
+        # The StatefulSet itself keeps the top-level annotations alone.
+        assert stateful_set["metadata"]["annotations"] == release
+        pods[stateful_set["metadata"]["name"]] = stateful_set["spec"]["template"]
+    for service in _get_documents(documents, "Service"):
+        assert service["metadata"]["annotations"] == release
+    assert pods["agent-env-my-release-default"]["metadata"]["annotations"] == {
+        "shared": "release",
+        "both": "default",
+        "mine": "default",
+    }
+    assert pods["agent-env-my-release-server"]["metadata"]["annotations"] == {
+        **release,
+        "mine": "server",
+    }
+
+
+def test_termination_grace_period_is_set_per_service(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "services.graceful.image=nginx,"
+        "services.graceful.terminationGracePeriodSeconds=1",
+    )
+
+    assert {
+        stateful_set["metadata"]["name"]: stateful_set["spec"]["template"]["spec"][
+            "terminationGracePeriodSeconds"
+        ]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    } == {
+        "agent-env-my-release-default": 0,
+        "agent-env-my-release-server": 0,
+        "agent-env-my-release-graceful": 1,
+    }
+
+
+def test_pod_annotations_must_be_strings(chart_dir: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_str="services.default.podAnnotations.n=1")
+    assert "podAnnotations" in exc_info.value.stderr
+
+
 @pytest.mark.parametrize(
     "labels",
     [
@@ -738,7 +798,9 @@ def test_network_policies_render_by_default(chart_dir: Path) -> None:
 def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> None:
     documents = _run_helm_template(chart_dir, set_str="networkPolicy.enabled=false")
 
-    assert not [doc for doc in documents if "cilium.io" in doc["apiVersion"]]
+    assert not [
+        doc for doc in documents if doc["apiVersion"].split("/")[0] == "cilium.io"
+    ]
     assert _get_documents(documents, "StatefulSet")
 
 

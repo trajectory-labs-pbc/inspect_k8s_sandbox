@@ -1,18 +1,43 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import hashlib
 import logging
 import os
+import re
+import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
 
-from inspect_ai.util import ExecResult
+from inspect_ai.util import ExecResult, SandboxUserUnsupportedError
 
-from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
-from k8s_sandbox._pod.execute import ExecuteOperation
+from k8s_sandbox._kubernetes_api import k8s_client
+from k8s_sandbox._pod.error import (
+    ContainerRestartedError,
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    PodError,
+    PodReplacedError,
+)
+from k8s_sandbox._pod.execd import (
+    EXECD_PATH,
+    EXECD_PORT,
+    Daemon,
+    DaemonRunning,
+    ExecdClient,
+    ExecdStream,
+)
+from k8s_sandbox._pod.execute import (
+    EXEC_USER_URL,
+    ROOT_USERS,
+    ExecuteOperation,
+    PodStdio,
+)
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
+from k8s_sandbox._pod.snapshot import read_pod
 from k8s_sandbox._pod.write import WriteFileOperation
 
 T = TypeVar("T")
@@ -39,6 +64,7 @@ class Pod:
         uid: str,
         initial_restart_count: int,
         restarted_container_behavior: Literal["warn", "raise"],
+        execd: bool = False,
     ) -> None:
         self._info = PodInfo(
             name,
@@ -49,13 +75,47 @@ class Pod:
             initial_restart_count,
             restarted_container_behavior,
         )
+        # Whether exec() can start runuser directly to run as a user, per pod,
+        # container start and user (see exec()).
+        self._switch: dict[tuple[str, int, str], bool | None] = {}
+        # What a check in "raise" mode detected, which every later operation raises.
+        self._restart_error: PodReplacedError | ContainerRestartedError | None = None
+        self._restart_lock = threading.Lock()
+        # Operations go over the pod network to execd, if the pod has it (see execd.py).
+        self._execd = ExecdClient(self._start_execd) if execd else None
+
+    async def _start_execd(self, replace: bool) -> Daemon:
+        """Start execd; restarts are checked here, since a restart stops the daemon."""
+        await self.check_for_pod_restart()
+        info = self._info
+        api = k8s_client(info.context_name)
+        # Read first, so a started daemon is never lost to a failed read.
+        pod = await self._run_async(
+            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+        )
+        if pod.ip is None:
+            raise PodError("The pod has no IP address for execd", pod=info.name)
+        key = os.urandom(32)
+        cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
+        cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+        cmd += ["--replace"] if replace else []
+        code, stdout, stderr = await self._run_async(
+            lambda: ExecuteOperation(info).run_argv(cmd)
+        )
+        if b"address already in use" in stderr:
+            raise DaemonRunning(stderr.decode(errors="replace"))
+        # Exactly the fingerprint execd prints: anything else, cut output too, fails.
+        if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
+            raise PodError("execd did not start", returncode=code, stderr=stderr)
+        return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
     def info(self) -> PodInfo:
         """The current cached pod identity.
 
         Note that ``uid`` and ``initial_restart_count`` may be replaced by
-        ``check_for_pod_restart`` if a replacement or restart is observed.
+        ``check_for_pod_restart`` if a replacement or restart is observed in
+        ``"warn"`` mode.
         """
         return self._info
 
@@ -64,13 +124,14 @@ class Pod:
     ) -> PodReplacedError | ContainerRestartedError | None:
         """Check whether the pod has been replaced or its container has restarted.
 
-        On detection, refreshes the cached identity (``uid`` and/or
-        ``initial_restart_count``) so subsequent operations target the new pod
-        without re-raising the same condition. Whether the detection raises is
-        governed by ``restarted_container_behavior``:
+        What a detection does is governed by ``restarted_container_behavior``:
 
-        - ``"warn"``: log a warning and return the detected error.
-        - ``"raise"``: raise ``PodReplacedError`` or ``ContainerRestartedError``.
+        - ``"warn"``: log a warning, refresh the cached identity (``uid`` and/or
+          ``initial_restart_count``) so subsequent operations target the new pod
+          without reporting the same condition, and return the detected error.
+        - ``"raise"``: raise ``PodReplacedError`` or ``ContainerRestartedError``, and
+          raise it again on every later check, without reading the pod: the pod or
+          container the sample had is gone.
         """
         return await self._run_async(self._check_for_pod_restart_sync)
 
@@ -79,25 +140,24 @@ class Pod:
     ) -> PodReplacedError | ContainerRestartedError | None:
         try:
             check_for_pod_restart(self._info)
-        except PodReplacedError as e:
-            self._info = dataclasses.replace(
-                self._info,
-                uid=e.new_uid,
-                initial_restart_count=e.new_restart_count,
-            )
-            if self._info.restarted_container_behavior == "warn":
-                logger.warning(str(e))
-                return e
-            raise
-        except ContainerRestartedError as e:
-            self._info = dataclasses.replace(
-                self._info,
-                initial_restart_count=e.restart_count,
-            )
-            if self._info.restarted_container_behavior == "warn":
-                logger.warning(str(e))
-                return e
-            raise
+        except (PodReplacedError, ContainerRestartedError) as e:
+            if self._info.restarted_container_behavior == "raise":
+                # A copy, without the frames of the operations it passes through.
+                self._keep(type(e)(**vars(e)))
+                raise
+            if isinstance(e, PodReplacedError):
+                self._info = dataclasses.replace(
+                    self._info,
+                    uid=e.new_uid,
+                    initial_restart_count=e.new_restart_count,
+                )
+            else:
+                self._info = dataclasses.replace(
+                    self._info,
+                    initial_restart_count=e.restart_count,
+                )
+            logger.warning(str(e))
+            return e
         return None
 
     async def exec(
@@ -128,12 +188,14 @@ class Pod:
         To support the required functionality, the supplied command is executed in a
         shell (/bin/sh).
 
-        To allow this method to return when the supplied command has completed, even if
-        backgrounded processes which inherit stdout or stderr are still running, a
-        sentinel value is written to stdout after the supplied command has completed.
-        When this sentinel value is detected, we close the websocket connection. This
-        sentinel value also includes the exit code of the supplied command, as we won't
-        have access to /bin/sh's return code if we manually close the websocket.
+        The exit code comes from the exec's status channel, which reports /bin/sh's own
+        exit status. To allow this method to return when the supplied command has
+        completed, even if backgrounded processes which inherit stdout or stderr are
+        still running, the shell writes a marker to both stdout and stderr once the
+        command exits. The marker holds a random value made up for this exec, so the
+        command's output cannot imitate it, and the command's exit code. If the
+        websocket connection is still open shortly after both markers arrive, we close
+        it and use the marker's exit code.
 
         Args:
           cmd (list[str]): The command and arguments to execute.
@@ -147,38 +209,106 @@ class Pod:
           env (dict[str, str]): The environment variables to set before running cmd.
           user (str | None): The user to run the command as. If None, the default user
             for the pod will be used. The container must be running as root to run as a
-            different user and the runuser command must be available in the container.
+            different user and runuser must be available at /sbin/runuser.
           timeout (int | None): The optional timeout for cmd to complete in. Defaults to
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
-            terminate background processes started by cmd.
+            terminate background processes started by cmd. On a pod with execd, cmd and
+            every process it started get SIGKILL instead.
         """
+        if self._execd is not None:
+            return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
         warned_restart = await self.check_for_pod_restart()
-        executor = ExecuteOperation(self._info)
-        result = await self._run_async(
-            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout)
-        )
+        info = self._info
+        executor = ExecuteOperation(info)
+        # Probing once per container spares later execs that switch user two process
+        # starts each.
+        key = (info.uid, info.initial_restart_count, user or "")
+        try:
+            if user and user not in ROOT_USERS and key not in self._switch:
+                try:
+                    self._switch[key] = await self._run_async(
+                        lambda: executor.probe_switch(user)
+                    )
+                except (PodError, PodReplacedError, ContainerRestartedError):
+                    # A probe that timed out: the shell's own check would wait on the
+                    # same container, unbounded. Or a container that stopped under it.
+                    raise
+                except Exception:
+                    logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
+            # A probe answers for the container it ran in: if this one was replaced or
+            # restarted meanwhile, let its shell check for itself this time.
+            switch = (
+                bool(self._switch.get(key)) if user and self._info == info else False
+            )
+            result = await self._run_async(
+                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
+            )
+        except ExecResultUnknownError:
+            # A container restarted or replaced under the command explains the lost
+            # result better.
+            if warned_restart is not None:
+                raise warned_restart
+            await self._diagnose_restart_after_failure()
+            raise
         if not result.success:
             if warned_restart is not None:
                 raise warned_restart
-            await self._diagnose_restart_after_failed_exec()
+            await self._diagnose_restart_after_failure()
         return result
 
-    async def _diagnose_restart_after_failed_exec(self) -> None:
+    async def exec_stdio(
+        self, cmd: list[str], user: str | None
+    ) -> PodStdio | ExecdStream:
+        """Start a command as exec() would, and join a stream to its stdin and stdout.
+
+        Closing the stream ends the command's stdin and stdout. Until then the stream
+        holds the exec's connection, so callers must close it.
+
+        In "raise" mode a restart found already, or one Kubernetes shows, raises here
+        as for exec(), rather than starting the command in the replacement. A stream
+        that ends with 255 after the command wrote stdout, Kata's status for a command
+        whose VM stopped, keeps a restart for every later operation: so the command must
+        not exit 255 itself once it has written. A stream open when a restart is found
+        drops, as one whose connection was lost.
+        """
+        if self._execd is not None:
+            return await self._execd.open_stream(cmd, user)
+        await self.check_for_pod_restart()
+        operation = ExecuteOperation(self._info)
+        stack, ws_client = await self._run_async(
+            lambda: operation.open_stdio(cmd, user),
+            # The websocket opened for a caller that won't get it.
+            discard=lambda opened: opened[0].close(),
+        )
+        return PodStdio(
+            stack,
+            ws_client,
+            stopped=self._stdio_stopped,
+            restarted=lambda: self._restart_error,
+        )
+
+    def _stdio_stopped(self) -> None:
+        if self._info.restarted_container_behavior == "raise":
+            self._keep_stopped()
+
+    async def _diagnose_restart_after_failure(self) -> None:
         try:
             restart = await self.check_for_pod_restart()
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
             logger.warning(
-                "Post-exec restart re-check failed; returning original exec result",
+                "Restart re-check failed; keeping the failed operation's result",
                 exc_info=True,
             )
+            # Unless an operation kept one meanwhile.
+            self._raise_restart()
             return
         if restart is not None:
             raise restart
 
-    async def write_file(self, data: bytes, dst: Path) -> None:
+    async def write_file(self, data: bytes, dst: Path, user: str | None = None) -> None:
         """
         Write ``data`` from the client to a path on the pod (dst).
 
@@ -188,13 +318,23 @@ class Pod:
           data (bytes): The contents to write to the pod.
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
+          user (str | None): The user to write the file, and make its directories, as.
+            If None, the container's user. Raises SandboxUserUnsupportedError, before
+            anything is written, if the container cannot run as them (see exec()).
         """
+        if self._execd is not None:
+            return await self._execd.write_file(data, dst, user)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
+        switch = await self._file_user_switch(user)
         writer = WriteFileOperation(self._info)
-        await self._run_async(lambda: writer.write_file(data, dst))
+        await self._after_failure_check(
+            lambda: writer.write_file(data, dst, user, switch)
+        )
 
-    async def read_file(self, src: Path, dst: IO[bytes]) -> None:
+    async def read_file(
+        self, src: Path, dst: IO[bytes], user: str | None = None
+    ) -> None:
         """
         Copy a file from the pod (src) to a file-like object (dst) on the client.
 
@@ -205,13 +345,142 @@ class Pod:
           src (Path): The path to the file on the pod. Relative paths will be resolved
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
+          user (str | None): The user to read the file as, as for write_file().
         """
+        if self._execd is not None:
+            return await self._execd.read_file(src, dst, user)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
+        switch = await self._file_user_switch(user)
         reader = ReadFileOperation(self._info)
-        await self._run_async(lambda: reader.read_file(src, dst))
+        await self._after_failure_check(
+            lambda: reader.read_file(src, dst, user, switch)
+        )
 
-    async def _run_async(self, callable: Callable[[], T]) -> T:
-        """Run a synchronous function asynchronously."""
+    async def _file_user_switch(self, user: str | None) -> bool:
+        """Whether a file operation as `user` starts `runuser` directly (see exec()).
+
+        Probed once per container and user, as for exec(), but before the operation
+        rather than by its shell: a file operation as a user the container cannot run
+        as must not start. A user it could not run as is probed again each time: the
+        sample may have created them since.
+        """
+        if user is None:
+            return False
+        info = self._info
+        key = (info.uid, info.initial_restart_count, user)
+        switch = self._switch.get(key)
+        if switch is None:
+            switch = self._switch[key] = await self._run_async(
+                lambda: ExecuteOperation(info).probe_switch(user)
+            )
+        if switch is None:
+            raise SandboxUserUnsupportedError(
+                f"The container cannot read or write files as user '{user}': it does "
+                "not run as them, and cannot switch to them (that needs root, "
+                f"/sbin/runuser and a user that exists). Docs: {EXEC_USER_URL}"
+            )
+        return switch
+
+    async def _after_failure_check(self, callable: Callable[[], None]) -> None:
+        """Run a file operation, and in "raise" mode check for a restart if it fails.
+
+        Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
+        container has none of the files the sample wrote, and the provider's retry of a
+        lost connection must not reach it unchecked. "warn" mode leaves the failure, and
+        any retry, as they were.
+        """
+        try:
+            await self._run_async(callable)
+        except (PodReplacedError, ContainerRestartedError):
+            raise
+        except Exception:
+            if self._info.restarted_container_behavior == "raise":
+                await self._diagnose_restart_after_failure()
+            raise
+
+    async def _run_async(
+        self, callable: Callable[[], T], discard: Callable[[T], object] | None = None
+    ) -> T:
+        """Run a synchronous function asynchronously.
+
+        Once a check in "raise" mode has detected a restart, raise it instead: before
+        running the function, and after, if it was detected meanwhile, whether the
+        function returned or failed. In "raise" mode a container that stopped under
+        the function counts as restarted. DISCARD closes a result the caller won't
+        get, such as an open connection: one a restart was found in, or one that came
+        once the caller stopped waiting.
+        """
+
+        def run() -> T:
+            self._raise_restart()
+            try:
+                result = callable()
+            except ContainerStoppedError as e:
+                if self._info.restarted_container_behavior == "raise":
+                    error = self._keep_stopped()
+                    raise type(error)(**vars(error)) from e
+                raise
+            except Exception:
+                # A restart found while it ran explains its failure better.
+                self._raise_restart()
+                raise
+            try:
+                self._raise_restart()
+            except (PodReplacedError, ContainerRestartedError):
+                if discard is not None:
+                    discard(result)
+                raise
+            return result
+
+        # Not queued behind other operations if it was found already, but suspended
+        # first, as queueing would have: a caller retrying in a loop must not hold the
+        # event loop.
+        if self._restart_error is not None:
+            await asyncio.sleep(0)
+            self._raise_restart()
         executor = PodOpExecutor.get_instance()
-        return await executor.queue_operation(callable)
+        try:
+            result = await executor.queue_operation(run, discard=discard)
+        except (PodReplacedError, ContainerRestartedError):
+            raise
+        except Exception:
+            # Also if it was found before this resumed.
+            self._raise_restart()
+            raise
+        try:
+            self._raise_restart()
+        except (PodReplacedError, ContainerRestartedError):
+            if discard is not None:
+                # Not on the event loop: closing a connection can wait on the server.
+                threading.Thread(target=discard, args=(result,), daemon=True).start()
+            raise
+        return result
+
+    def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
+        """Keep the restart of a container that stopped under an operation."""
+        info = self._info
+        # Gone, though Kubernetes may not show it stopped yet.
+        return self._keep(
+            ContainerRestartedError(
+                pod_name=info.name,
+                container_name=info.default_container_name,
+                restart_count=info.initial_restart_count + 1,
+                last_reason="stopped under an operation",
+            )
+        )
+
+    def _keep(
+        self, error: PodReplacedError | ContainerRestartedError
+    ) -> PodReplacedError | ContainerRestartedError:
+        """Keep ERROR unless a restart was kept already, and return the one kept."""
+        with self._restart_lock:
+            if self._restart_error is None:
+                self._restart_error = error
+            return self._restart_error
+
+    def _raise_restart(self) -> None:
+        if (error := self._restart_error) is not None:
+            # A copy: one exception raised again collects each raise's frames, and
+            # concurrent raises would share them.
+            raise type(error)(**vars(error))

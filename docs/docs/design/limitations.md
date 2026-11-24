@@ -41,10 +41,14 @@ chart](../helm//built-in-chart.md#resource-requests-and-limits).
 
 You can reduce the impact of a container restarting by using persistent volumes.
 
-The framework will issue a warning if a container restarts during an eval. If a
-subsequent `exec()` fails after a detected restart, the restart is raised as the cause
-regardless of mode. If you set the `restarted_container_behaviour` parameter to `raise`,
-the eval will fail the sample immediately on detection, even if `exec()` has not failed.
+The framework will issue a warning if a container restarts during an eval. If an
+`exec()` returns a failure or loses its result, and the check before or after it finds a
+restart, the restart is raised as the cause regardless of mode. If you set the
+`restarted_container_behavior` parameter to `raise`, the eval will fail the sample
+immediately on detection, even if `exec()` has not failed, and a `read_file()` or
+`write_file()` that fails checks for a restart too.
+Every later `exec()`, `read_file()` and `write_file()` in that sandbox raises the same
+error, so a solver that catches it cannot carry on in the restarted container.
 
 ??? question "Why not use Jobs over StatefulSets?"
 
@@ -155,9 +159,13 @@ the `hostAliases` field in the Pod spec
 
 Transient network or infrastructure errors during `exec()`, `read_file()`, and `write_file()` are automatically retried (up to 5 times). These are typically caused by issues such as a node becoming unhealthy, a Pod being rescheduled, or the Kubernetes control plane being overloaded.
 
-Note that retries cannot guarantee idempotency — if a command partially executed before the error, it may run again on retry.
+Retries cannot guarantee idempotency: an `exec()` whose connection is lost once its
+command was sent raises `ExecResultUnknownError` and is retried, so the command may run a
+second time. If the container restarted or was replaced meanwhile, `exec()` raises that
+error instead and is not retried. A Pod with execd resumes the command instead, and never
+runs it a second time.
 
-## Must run as root to use the `user` parameter in `exec()` { #exec-user }
+## Must run as root to use the `user` parameter in `exec()`, `read_file()` and `write_file()` { #exec-user }
 
 In Kubernetes, a container runs as a single user. The user can be specified in the
 `values.yaml` file. For example, if using the [built-in Helm
@@ -178,13 +186,18 @@ result in undesirable coupling between your tools and sandbox.
 
 That said, if you need to run commands as different users, the `user` parameter to
 `exec()` is supported. To switch to a *different* user, you must run the container as
-root, ensure that `runuser` is installed in the container, and keep `CAP_SETGID` — the
+root, ensure that `runuser` is installed at `/sbin/runuser`, and keep `CAP_SETGID` — the
 switch goes through `runuser`, which calls `setgroups(2)`. A container with
 `capabilities: {drop: [ALL]}` therefore cannot switch users.
 
 Naming the user the container already runs as needs none of those: that case skips
-`runuser` entirely, so it works on a capability-dropped or non-root container, and on an
+`runuser` entirely (it checks the user with `id`, from `/usr/bin` or `/bin`), so it works on a capability-dropped or non-root container, and on an
 image with no `runuser` installed.
+
+`user="root"` and `user="0"` both mean uid 0, whatever the image's `/etc/passwd` says,
+and never go through `runuser`: the command runs in the container's own shell once that
+shell has read its uid, 0, from `/proc/self/status`. A container that does not run as
+uid 0, or whose `/proc` cannot be read, fails them as it fails a switch it cannot make.
 
 When the switch cannot be made, what happens depends on why. A container that is not
 root, one that has had `CAP_SETGID` dropped, and one without `runuser` installed are all
@@ -192,6 +205,15 @@ properties of the environment rather than bad arguments: each logs a warning and
 a failed `ExecResult`, so a caller which probes with a user can fall back to the
 container's own user. Only naming a user that does not exist raises, since no fallback
 makes an absent account work.
+
+`read_file()` and `write_file()` take the same `user`. The file is then read or written
+as that user, and the directories a write makes are theirs, so their permissions apply,
+through a symbolic link too. The switch is made as `exec()` makes it, and `root` and `0`
+mean uid 0 in the same way. What differs is the failure: a user the container cannot run
+as, for any of the reasons above or because the user does not exist, raises
+`SandboxUserUnsupportedError` before anything is read or written, which is what Inspect
+asks of a sandbox provider. With no `user`, a file operation runs as the container's
+user, as it always has.
 
 ## Images are not automatically built, tagged or pushed
 
