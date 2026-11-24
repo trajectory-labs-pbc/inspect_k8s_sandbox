@@ -292,7 +292,7 @@ def test_env_var_skips_file_op_check_but_not_exec(monkeypatch):
     ) as mock_get_instance:
         executor = MagicMock()
 
-        async def queue(callable, discard=None):
+        async def queue(callable, discard=None, on_cancel=None):
             return callable()
 
         executor.queue_operation = queue
@@ -332,7 +332,7 @@ def test_env_var_default_keeps_file_op_check(monkeypatch):
     ) as mock_get_instance:
         executor = MagicMock()
 
-        async def queue(callable, discard=None):
+        async def queue(callable, discard=None, on_cancel=None):
             return callable()
 
         executor.queue_operation = queue
@@ -634,7 +634,7 @@ def test_a_result_got_before_a_restart_was_found_but_returned_after_it_is_droppe
     )
     executor = MagicMock()
 
-    async def queue(callable, discard=None):
+    async def queue(callable, discard=None, on_cancel=None):
         result = callable()
         # Another operation finds the restart before this one resumes.
         pod._restart_error = restart
@@ -661,7 +661,7 @@ def test_a_failure_got_before_a_restart_was_found_but_raised_after_it_raises_it(
     pod = _make_pod()
     executor = MagicMock()
 
-    async def queue(callable, discard=None):
+    async def queue(callable, discard=None, on_cancel=None):
         try:
             return callable()
         finally:
@@ -923,7 +923,7 @@ def _opening_stdio(after_queued=None):
     """
     calls = 0
 
-    async def queue(callable, discard=None):
+    async def queue(callable, discard=None, on_cancel=None):
         nonlocal calls
         calls += 1
         if after_queued is not None:
